@@ -36,7 +36,7 @@ MoviePilot-Plugins/
 ├── plugins.v2/strmprewarmer/# V2 宿主实现（与 V3 同源）
 ├── plugins.v3/strmprewarmer/# 插件源码，以此目录为准
 ├── icons/                   # 插件图标
-├── scripts/sync_plugin.py   # 同步各代实现并校验索引版本
+├── scripts/                 # 同步、宿主导入校验与发布脚本
 └── tests/v3/strmprewarmer/  # 单元测试
 ```
 
@@ -54,6 +54,12 @@ python3 scripts/sync_plugin.py --check
 
 # 运行单元测试（无需 MoviePilot 宿主，测试内置宿主桩模块）
 python3 -m pytest tests/v3 -q
+
+# 校验插件对宿主的导入在真实 MoviePilot 源码中可解析（V2/V3 各一份源码）
+python3 scripts/check_host_imports.py /path/to/MoviePilot-v3 /path/to/MoviePilot-v2
+
+# 发布到 GitHub（需先 gh auth login，或已手动创建空仓库）
+bash scripts/publish.sh
 ```
 
 ## 许可证

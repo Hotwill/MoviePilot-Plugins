@@ -25,6 +25,20 @@ STRM 入库后立即通过 Emby 的 `PlaybackInfo` 接口触发真实媒体探�
 实时监控，或启用官方「媒体库服务器刷新」插件；也可以打开本插件的
 「找不到时扫描媒体库」开关。
 
+### 配置 Emby Webhook（推荐，最快触发）
+
+Emby 后台 →「通知 / Webhooks」→ 新增 Webhook：
+
+```text
+URL: http(s)://<MoviePilot地址>/api/v1/webhook?token=<API_TOKEN>&source=<媒体服务器名称>
+请求内容类型: application/json
+事件: 勾选「媒体库 → 新媒体已添加」(library.new)
+```
+
+- `API_TOKEN` 是 MoviePilot 的 `API_TOKEN` 环境变量值；
+- `source` 必须与 MoviePilot 中该 Emby 服务器的名称一致，否则事件无法归属到具体服务器；
+- 剧集入库时 Emby 上报的是剧集 ID，插件会按文件路径重新定位到具体分集，无需额外配置。
+
 ## 配置说明
 
 | 配置 | 默认 | 说明 |

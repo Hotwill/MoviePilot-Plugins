@@ -18,7 +18,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install pytest==8.3.4 apscheduler==3.11.0
+        run: pip install pytest==8.3.4 apscheduler==3.11.0 requests==2.32.3
 
       - name: Compile plugin sources
         run: python -m compileall -q plugins.v3 plugins.v2 plugins

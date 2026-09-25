@@ -472,18 +472,22 @@ class StrmPrewarmer(_PluginBase):
         return data.get("Items") or []
 
     def _find_item_by_path(self, service: ServiceInfo, emby_path: str) -> Optional[dict]:
-        """根据 Emby 内部路径查找条目，依次尝试 Path 过滤与文件名搜索。"""
+        """根据 Emby 内部路径查找条目：Path 过滤 -> 文件名搜索 -> 深度遍历。"""
         if not emby_path:
             return None
         target = emby_path.replace("\\", "/").lower()
-        # 优先使用 Emby 的 Path 查询参数（Emby 4.7+ 支持）
-        for items in (self._query_items(service, {"Path": emby_path, "Limit": "20"}),
-                      self._query_items(service, {"SearchTerm": Path(emby_path).stem, "Limit": "50"})):
+        # 查询策略按代价从低到高惰性执行，命中即返回，避免多余请求
+        strategies = (
+            lambda: self._query_items(service, {"Path": emby_path, "Limit": "20"}),
+            lambda: self._query_items(service, {"SearchTerm": Path(emby_path).stem, "Limit": "50"}),
+        )
+        for strategy in strategies:
+            items = strategy()
             for item in items:
                 item_path = (item.get("Path") or "").replace("\\", "/").lower()
                 if item_path == target:
                     return item
-            # Path 精确过滤只返回一条时直接采用
+            # 精确过滤只返回一条且文件名一致时直接采用
             if len(items) == 1 and items[0].get("Path"):
                 only_path = items[0]["Path"].replace("\\", "/").lower()
                 if Path(only_path).name == Path(target).name:

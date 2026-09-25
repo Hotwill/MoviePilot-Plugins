@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install pytest==8.3.4 apscheduler==3.11.0
+
+      - name: Compile plugin sources
+        run: python -m compileall -q plugins.v3 plugins.v2 plugins
+
+      - name: Check index versions and mirrored implementations
+        run: python scripts/sync_plugin.py --check
+
+      - name: Run unit tests
+        run: python -m pytest tests/v3 -q
+
+      - name: Check whitespace errors
+        run: git diff --check

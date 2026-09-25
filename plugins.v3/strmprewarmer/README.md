@@ -20,6 +20,7 @@ STRM 入库后立即通过 Emby 的 `PlaybackInfo` 接口触发真实媒体探�
 | 媒体库 Webhook | Emby `library.new` 事件（需在 Emby 中配置 MoviePilot Webhook），按文件路径定位分集后预热 |
 | 定时扫描 | 按 Cron 周期全量扫描，补齐缺失媒体信息、识别换源 |
 | 远程命令 | 交互消息发送 `/strm_prewarm` 手动触发一次全量扫描 |
+| 插件 API | 第三方工具生成 STRM 后可直接调用接口触发，见下方「插件 API」 |
 
 入库后 Emby 需要先扫描到新文件，插件才能找到对应条目。建议同时开启 Emby 媒体库
 实时监控，或启用官方「媒体库服务器刷新」插件；也可以打开本插件的
@@ -78,6 +79,33 @@ MoviePilot 与 Emby 常常通过不同的容器映射看到同一个目录。插
 ```
 
 分隔符支持 `=>`、`|` 和 `:`（`:` 会跳过 Windows 盘符冒号）。如果两侧路径一致则无需配置。
+
+## 插件 API
+
+适用于 STRM 由第三方工具（网盘挂载、自建脚本等）生成、不经过 MoviePilot 整理的场景。
+
+```bash
+# 触发一次预热（apikey 鉴权，path 为 MoviePilot 可见路径）
+curl -X POST "http://<MoviePilot>/api/v1/plugin/StrmPrewarmer/prewarm?apikey=<API_TOKEN>&path=/media/strm/movie.strm"
+
+# path 已经是 Emby 内部路径时
+curl -X POST "http://<MoviePilot>/api/v1/plugin/StrmPrewarmer/prewarm?apikey=<API_TOKEN>&path=/data/media/movie.strm&side=emby"
+
+# 也可以直接指定 Emby 条目 ID
+curl -X POST "http://<MoviePilot>/api/v1/plugin/StrmPrewarmer/prewarm?apikey=<API_TOKEN>&item_id=1001"
+```
+
+| 接口 | 方法 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| `/api/v1/plugin/StrmPrewarmer/status` | GET | bear | 运行状态、队列长度与历史统计 |
+| `/api/v1/plugin/StrmPrewarmer/history` | GET | bear | 最近的预热记录，支持 `limit` |
+| `/api/v1/plugin/StrmPrewarmer/prewarm` | POST | apikey | 外部触发预热，参数 `path`/`item_id`/`server`/`side`/`delay` |
+
+返回统一为三段式结构：
+
+```json
+{"success": true, "message": "已加入预热队列", "data": {"queued": 1, "path": "/media/strm/movie.strm", "item_id": null}}
+```
 
 ## 工作原理
 

@@ -130,13 +130,67 @@ def test_form_and_page_serializable(plugin):
     assert page
 
 
-def test_command_and_api_declarations(plugin, plugin_class):
-    """命令声明正确，且未注册多余 API。"""
+def test_command_declaration(plugin, plugin_class):
+    """命令声明正确。"""
     plugin.init_plugin({"enabled": False})
     command = plugin_class.get_command()[0]
     assert command["cmd"] == "/strm_prewarm"
     assert command["data"] == {"action": "strm_prewarm"}
-    assert plugin.get_api() == []
+
+
+def test_api_declarations_register_on_fastapi(plugin):
+    """插件 API 声明必须能在宿主的 FastAPI 上真实注册并生成 OpenAPI。"""
+    from fastapi import FastAPI
+
+    plugin.init_plugin({"enabled": False})
+    apis = plugin.get_api()
+    assert [api["path"] for api in apis] == ["/status", "/history", "/prewarm"]
+
+    app = FastAPI()
+    for api in apis:
+        app.add_api_route(
+            f"/api/v1/plugin/StrmPrewarmer{api['path']}",
+            api["endpoint"],
+            methods=api["methods"],
+            response_model=api["response_model"],
+            summary=api["summary"],
+        )
+    schema = app.openapi()
+    paths = schema["paths"]
+    assert "/api/v1/plugin/StrmPrewarmer/status" in paths
+    assert "/api/v1/plugin/StrmPrewarmer/prewarm" in paths
+    # 响应模型必须暴露三段式结构，而不是被隐藏
+    properties = schema["components"]["schemas"]["ApiResult"]["properties"]
+    assert {"success", "message", "data"}.issubset(set(properties))
+
+
+def test_api_endpoints_return_expected_shape(plugin):
+    """通过 TestClient 实际调用插件 API，校验返回结构。"""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    plugin.init_plugin({"enabled": True})
+    app = FastAPI()
+    for api in plugin.get_api():
+        app.add_api_route(f"/plugin{api['path']}", api["endpoint"],
+                          methods=api["methods"], response_model=api["response_model"])
+    client = TestClient(app)
+
+    status = client.get("/plugin/status").json()
+    assert status["success"] is True
+    assert status["data"]["enabled"] is True
+
+    accepted = client.post("/plugin/prewarm", params={"path": "/media/strm/a.strm"}).json()
+    assert accepted["success"] is True
+    assert accepted["data"]["path"] == "/media/strm/a.strm"
+
+    rejected = client.post("/plugin/prewarm", params={"path": "/media/a.mkv"}).json()
+    assert rejected["success"] is False
+
+    history = client.get("/plugin/history", params={"limit": 5}).json()
+    assert history["success"] is True
+    assert "records" in history["data"]
+    plugin.stop_service()
 
 
 def test_service_registration_and_thread_lifecycle(plugin):

@@ -688,3 +688,85 @@ def test_process_target_incomplete_reason_skips_check():
     record = instance._process_target("Emby", _service(), complete_item, "F", "定时", reason="incomplete")
     assert calls == ["6"]
     assert record["status"] == "success"
+
+
+def test_get_api_declares_three_endpoints():
+    """插件应注册状态、历史与外部触发三个接口。"""
+    instance = _plugin()
+    apis = instance.get_api()
+    assert [api["path"] for api in apis] == ["/status", "/history", "/prewarm"]
+    assert [api["methods"] for api in apis] == [["GET"], ["GET"], ["POST"]]
+    assert [api["auth"] for api in apis] == ["bear", "bear", "apikey"]
+    for api in apis:
+        assert callable(api["endpoint"])
+        assert api["response_model"] is plugin_module.ApiResult
+
+
+def test_api_status_reports_runtime_state():
+    """状态接口应返回启用状态、队列长度与历史统计。"""
+    instance = _plugin()
+    instance._enabled = True
+    instance.save_data("history", [
+        {"status": "success", "title": "A"},
+        {"status": "fail", "title": "B"},
+        {"status": "success", "title": "C"},
+    ])
+    result = instance.api_status()
+    assert result.success is True
+    assert result.data["enabled"] is True
+    assert result.data["queued"] == 0
+    assert result.data["history_counts"] == {"success": 2, "fail": 1}
+    assert result.data["last_record"]["title"] == "A"
+
+
+def test_api_history_respects_limit():
+    """历史接口应按 limit 截断并返回总数。"""
+    instance = _plugin()
+    instance.save_data("history", [{"status": "success", "title": str(i)} for i in range(10)])
+    result = instance.api_history(limit=3)
+    assert result.data["total"] == 10
+    assert len(result.data["records"]) == 3
+
+
+def test_api_prewarm_enqueues_task():
+    """外部触发接口应把任务加入队列。"""
+    instance = _plugin()
+    instance._enabled = True
+    result = instance.api_prewarm(path="/media/strm/a.strm")
+    assert result.success is True
+    task = instance._queue.get_nowait()
+    assert task["path"] == "/media/strm/a.strm"
+    assert task["path_side"] == "local"
+    assert task["source"] == "API"
+
+
+def test_api_prewarm_accepts_emby_side_and_item_id():
+    """接口支持 Emby 侧路径与条目 ID。"""
+    instance = _plugin()
+    instance._enabled = True
+    assert instance.api_prewarm(item_id="99", side="emby").success is True
+    task = instance._queue.get_nowait()
+    assert task["item_id"] == "99"
+    assert task["type"] == "item"
+    assert task["path_side"] == "emby"
+
+
+def test_api_prewarm_validates_input():
+    """接口应校验启用状态、参数与文件类型。"""
+    disabled = _plugin()
+    assert disabled.api_prewarm(path="/a.strm").success is False
+
+    instance = _plugin()
+    instance._enabled = True
+    assert instance.api_prewarm().success is False
+    assert "path" in instance.api_prewarm().message
+    assert instance.api_prewarm(path="/a.mkv").success is False
+    assert instance.api_prewarm(path="/a.strm", side="other").success is False
+    assert instance._queue.qsize() == 0
+
+
+def test_api_prewarm_allows_non_strm_when_configured():
+    """关闭仅 STRM 限制后非 STRM 也能触发。"""
+    instance = _plugin(only_strm=False)
+    instance._enabled = True
+    assert instance.api_prewarm(path="/a.mkv").success is True

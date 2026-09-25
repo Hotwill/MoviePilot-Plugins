@@ -83,10 +83,21 @@ def test_form_and_page_on_v2(plugin):
     form, defaults = plugin.get_form()
     assert form and defaults
     assert plugin.get_page()
-    assert plugin.get_api() == []
+    assert [api["path"] for api in plugin.get_api()] == ["/status", "/history", "/prewarm"]
     assert plugin_module_command(plugin) == "/strm_prewarm"
 
 
 def plugin_module_command(plugin) -> str:
     """读取插件声明的远程命令。"""
     return type(plugin).get_command()[0]["cmd"]
+
+
+def test_api_endpoints_on_v2(plugin):
+    """V2 上插件 API 同样可调用并返回三段式结构。"""
+    plugin.init_plugin({"enabled": True})
+    status = plugin.api_status()
+    assert status.success is True and status.data["enabled"] is True
+    accepted = plugin.api_prewarm(path="/media/strm/a.strm")
+    assert accepted.success is True
+    assert plugin._queue.get_nowait()["source"] == "API"
+    plugin.stop_service()

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
+from pydantic import BaseModel, Field
 
 # 宿主导入：优先使用 V3 稳定 SDK，找不到时回退 V2 旧路径，
 # 使同一份实现可以在 MoviePilot V2 与 V3 宿主中运行。
@@ -48,6 +49,17 @@ ITEM_TYPES = "Movie,Episode,Video"
 PLAYABLE_TYPES = {"Movie", "Episode", "Video", "MusicVideo"}
 # 查询条目时需要返回的字段
 ITEM_FIELDS = "Path,MediaSources,MediaStreams"
+
+
+class ApiResult(BaseModel):
+    """插件 API 的统一返回结构，与宿主三段式响应保持一致。"""
+
+    # 请求或业务操作是否成功
+    success: bool
+    # 给调用方展示的说明文本
+    message: str = ""
+    # 业务数据
+    data: Dict[str, Any] = Field(default_factory=dict)
 
 
 def is_playable(item: dict) -> bool:
@@ -958,8 +970,95 @@ class StrmPrewarmer(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """当前插件不注册后端 API。"""
-        return []
+        """注册插件 API：查询状态、查询历史、外部触发预热。"""
+        return [
+            {
+                "path": "/status",
+                "endpoint": self.api_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查询预热插件状态",
+                "response_model": ApiResult,
+            },
+            {
+                "path": "/history",
+                "endpoint": self.api_history,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查询预热历史",
+                "response_model": ApiResult,
+            },
+            {
+                "path": "/prewarm",
+                "endpoint": self.api_prewarm,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "外部触发 STRM 预热",
+                "response_model": ApiResult,
+            },
+        ]
+
+    def api_status(self) -> "ApiResult":
+        """返回插件运行状态，供页面或外部系统查询。"""
+        history = self.get_data("history") or []
+        counts: Dict[str, int] = {}
+        for record in history:
+            status = str(record.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        return ApiResult(success=True, data={
+            "enabled": self.get_state(),
+            "queued": self._queue.qsize(),
+            "processing": len(self._inflight),
+            "scanning": self._scanning,
+            "listen_transfer": self._listen_transfer,
+            "listen_webhook": self._listen_webhook,
+            "only_strm": self._only_strm,
+            "cron": self._cron,
+            "history_counts": counts,
+            "last_record": history[0] if history else None,
+        })
+
+    def api_history(self, limit: int = 50) -> "ApiResult":
+        """返回最近的预热历史记录。"""
+        history = self.get_data("history") or []
+        limit = max(1, min(int(limit or 50), self._history_count))
+        return ApiResult(success=True, data={"total": len(history), "records": history[:limit]})
+
+    def api_prewarm(self, path: str = None, item_id: str = None, server: str = None,
+                    side: str = "local", delay: int = None) -> "ApiResult":
+        """外部触发预热，适用于由第三方工具生成 STRM 的场景。
+
+        :param path: STRM 文件路径
+        :param item_id: Emby 条目 ID，与 path 二选一
+        :param server: 限定媒体服务器名称，留空表示全部
+        :param side: path 属于哪一侧，``local`` 为 MoviePilot 路径，``emby`` 为 Emby 路径
+        :param delay: 覆盖入库后延迟秒数
+        """
+        if not self._enabled:
+            return ApiResult(success=False, message="插件未启用")
+        if not path and not item_id:
+            return ApiResult(success=False, message="缺少参数：path 或 item_id")
+        if path and self._only_strm and not is_strm(path):
+            return ApiResult(success=False, message="仅处理 STRM 文件，可在插件配置中关闭该限制")
+        if side not in ("local", "emby"):
+            return ApiResult(success=False, message="side 只能是 local 或 emby")
+        self._queue.put({
+            "type": "item" if item_id else "path",
+            "path": path,
+            "path_side": side,
+            "item_id": item_id,
+            "title": Path(path).stem if path else (item_id or ""),
+            "source": "API",
+            "server": server,
+            "delay": delay,
+        })
+        logger.info(f"API 触发预热：{path or item_id}")
+        return ApiResult(success=True, message="已加入预热队列", data={
+            "queued": self._queue.qsize(),
+            "path": path,
+            "item_id": item_id,
+        })
+
 
     def get_service(self) -> List[Dict[str, Any]]:
         """按配置注册定时全量补漏扫描任务。"""

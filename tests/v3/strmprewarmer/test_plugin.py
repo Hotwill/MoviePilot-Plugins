@@ -274,7 +274,8 @@ def test_process_target_detects_source_change(tmp_path):
     record = instance._process_target("Emby", _service(), item, "D", "定时")
     assert refreshed == ["12"]
     assert prewarmed == ["12"]
-    assert record["status"] == "success"
+    assert record["status"] == "changed"
+    assert record["detail"].startswith("换源重新预热")
     assert instance.get_data("fingerprints")["12"]["signature"]["sha256"] != "old"
 
 
@@ -500,7 +501,7 @@ def test_locate_item_prefers_path_over_series_id():
     instance = _plugin()
     episode = {"Id": "ep1", "Type": "Episode", "Path": "/data/media/tv/s01e01.strm"}
     series = {"Id": "series1", "Type": "Series", "Path": "/data/media/tv"}
-    instance._wait_for_item = lambda service, path, title: episode if path == episode["Path"] else None
+    instance._find_item_by_path = lambda service, path: episode if path == episode["Path"] else None
     instance._fetch_item = lambda service, item_id: series
     task = {"item_id": "series1", "path": episode["Path"], "path_side": "emby"}
     assert instance._locate_item(_service(), task, "剧集 S01E01")["Id"] == "ep1"
@@ -592,3 +593,57 @@ def test_transfer_task_marks_local_path():
     event = types.SimpleNamespace(event_data={"transferinfo": transferinfo, "mediainfo": None})
     instance.on_transfer_complete(event)
     assert instance._queue.get_nowait()["path_side"] == "local"
+
+
+def test_locate_item_emby_path_does_not_poll():
+    """Webhook 路径已在库中，应直接查询而不进入轮询等待。"""
+    instance = _plugin()
+    polled = []
+    instance._wait_for_item = lambda service, path, title: polled.append(path)
+    instance._find_item_by_path = lambda service, path: {"Id": "1", "Type": "Movie", "Path": path}
+    item = instance._locate_item(_service(), {"path": "/data/media/a.strm", "path_side": "emby"}, "A")
+    assert item["Id"] == "1"
+    assert polled == []
+
+
+def test_dedup_window_blocks_repeat():
+    """去重窗口内同一条目不应重复处理。"""
+    instance = _plugin(dedup_window=600)
+    key = ("Emby", "1")
+    assert instance._recently_done(key) is False
+    instance._mark_done(key)
+    assert instance._recently_done(key) is True
+
+
+def test_dedup_window_disabled():
+    """去重窗口为 0 时不做去重。"""
+    instance = _plugin(dedup_window=0)
+    key = ("Emby", "1")
+    instance._mark_done(key)
+    assert instance._recently_done(key) is False
+
+
+def test_handle_task_skips_duplicate_trigger():
+    """入库事件与 Webhook 重复触发同一条目时只处理一次。"""
+    instance = _plugin(dedup_window=600, delay=0)
+    item = {"Id": "42", "Type": "Movie", "Path": "/data/media/a.strm", "MediaSources": [{"MediaStreams": []}]}
+    processed = []
+    service = _service()
+    instance.__class__.service_infos = property(lambda self: {"Emby": service})
+    try:
+        instance._locate_item = lambda svc, task, title: item
+        instance._process_target = lambda name, svc, it, title, source, force=False: (
+            processed.append(it["Id"]) or {"status": "success", "title": title, "detail": ""})
+        instance._handle_task({"path": "/data/media/a.strm", "path_side": "emby", "source": "入库"})
+        instance._handle_task({"item_id": "42", "source": "Webhook"})
+    finally:
+        del instance.__class__.service_infos
+    assert processed == ["42"]
+
+
+def test_notify_treats_changed_as_success():
+    """换源重新预热成功时按成功通知。"""
+    instance = _plugin(notify=True, notify_success=True)
+    instance._notify_records([{"status": "changed", "title": "A", "detail": "换源重新预热 1920x1080"}])
+    assert len(instance.messages) == 1
+    assert "🔄" in instance.messages[0]["text"]

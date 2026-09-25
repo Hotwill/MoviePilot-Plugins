@@ -245,6 +245,7 @@ class StrmPrewarmer(_PluginBase):
         self._refresh_missing = False
         self._deep_lookup = True
         self._deep_lookup_limit = 20000
+        self._dedup_window = 600
         self._cron = ""
         self._onlyonce = False
         self._scan_roots: Tuple[str, ...] = ()
@@ -258,6 +259,8 @@ class StrmPrewarmer(_PluginBase):
         self._workers: List[threading.Thread] = []
         self._lock = threading.Lock()
         self._inflight: set = set()
+        # 最近成功处理过的条目，避免入库事件与 Webhook 重复预热
+        self._recent: Dict[Tuple[str, str], float] = {}
         self._scanning = False
 
     def init_plugin(self, config: dict = None) -> None:
@@ -282,6 +285,7 @@ class StrmPrewarmer(_PluginBase):
         self._refresh_missing = bool(config.get("refresh_missing"))
         self._deep_lookup = bool(config.get("deep_lookup", True))
         self._deep_lookup_limit = max(500, self._to_int(config.get("deep_lookup_limit"), 20000))
+        self._dedup_window = max(0, self._to_int(config.get("dedup_window"), 600))
         self._cron = (config.get("cron") or "").strip()
         self._onlyonce = bool(config.get("onlyonce"))
         self._scan_roots = parse_roots(config.get("scan_roots"))
@@ -348,6 +352,7 @@ class StrmPrewarmer(_PluginBase):
             "refresh_missing": self._refresh_missing,
             "deep_lookup": self._deep_lookup,
             "deep_lookup_limit": self._deep_lookup_limit,
+            "dedup_window": self._dedup_window,
             "cron": self._cron,
             "onlyonce": False,
             "scan_roots": "\n".join(self._scan_roots),
@@ -608,7 +613,7 @@ class StrmPrewarmer(_PluginBase):
                 logger.info(f"{display} 已有完整媒体信息，跳过预热")
                 return record
             logger.info(f"{display} STRM 源已变更，重新刷新并预热")
-            record["status"] = "changed"
+            record["changed"] = True
             self._trigger_refresh(service, item_id)
             self._stop_event.wait(2)
 
@@ -622,8 +627,9 @@ class StrmPrewarmer(_PluginBase):
             ok, message = self._prewarm(service, item_id)
             if ok:
                 elapsed = time.time() - started
-                record["status"] = "success"
-                record["detail"] = f"{message} 用时{elapsed:.1f}s".strip()
+                record["status"] = "changed" if record.get("changed") else "success"
+                prefix = "换源重新预热 " if record.get("changed") else ""
+                record["detail"] = f"{prefix}{message} 用时{elapsed:.1f}s".strip()
                 self._save_fingerprint(item_id, item_path, signature)
                 logger.info(f"预热成功 {display} {message} 用时{elapsed:.1f}s")
                 return record
@@ -663,8 +669,11 @@ class StrmPrewarmer(_PluginBase):
         raw_path = task.get("path")
         if raw_path:
             # 入库事件给出的是 MoviePilot 侧路径，需要映射；Webhook 给出的已是 Emby 侧路径
-            emby_path = raw_path if task.get("path_side") == "emby" else self._emby_path(raw_path)
-            item = self._wait_for_item(service, emby_path, title)
+            from_emby = task.get("path_side") == "emby"
+            emby_path = raw_path if from_emby else self._emby_path(raw_path)
+            # Webhook 触发时条目必然已在库中，直接查一次即可，不必轮询等待
+            item = (self._find_item_by_path(service, emby_path) if from_emby
+                    else self._wait_for_item(service, emby_path, title))
             if item:
                 return item
         if task.get("item_id"):
@@ -698,7 +707,8 @@ class StrmPrewarmer(_PluginBase):
                 continue
             key = (name, str(item.get("Id")))
             with self._lock:
-                if key in self._inflight:
+                if key in self._inflight or self._recently_done(key):
+                    logger.debug(f"{title or item.get('Path')} 正在处理或刚处理过，跳过重复触发")
                     continue
                 self._inflight.add(key)
             try:
@@ -706,9 +716,25 @@ class StrmPrewarmer(_PluginBase):
             finally:
                 with self._lock:
                     self._inflight.discard(key)
+                    self._mark_done(key)
         if records:
             self._record_history(records)
             self._notify_records(records)
+
+    def _recently_done(self, key: Tuple[str, str]) -> bool:
+        """判断条目是否在去重窗口内已经处理过；调用方需持有锁。"""
+        if not self._dedup_window:
+            return False
+        done_at = self._recent.get(key)
+        return bool(done_at and time.time() - done_at < self._dedup_window)
+
+    def _mark_done(self, key: Tuple[str, str]) -> None:
+        """记录条目处理时间并清理过期记录；调用方需持有锁。"""
+        now = time.time()
+        self._recent[key] = now
+        if len(self._recent) > 500:
+            window = self._dedup_window or 600
+            self._recent = {item: at for item, at in self._recent.items() if now - at < window}
 
     def _enqueue_paths(self, paths: List[str], title: str, source: str, server: str = None) -> None:
         """把待预热的文件路径放入任务队列。"""
@@ -884,13 +910,13 @@ class StrmPrewarmer(_PluginBase):
         """按配置推送预热结果通知。"""
         if not self._notify or not records:
             return
-        success = [record for record in records if record.get("status") == "success"]
+        success = [record for record in records if record.get("status") in ("success", "changed")]
         failed = [record for record in records if record.get("status") == "fail"]
         if not failed and not (success and self._notify_success):
             return
         lines = []
         for record in (records if summary else success + failed):
-            flag = {"success": "✅", "fail": "❌"}.get(record.get("status"), "➖")
+            flag = {"success": "✅", "changed": "🔄", "fail": "❌"}.get(record.get("status"), "➖")
             lines.append(f"{flag} {record.get('title')}\n{record.get('detail') or ''}".strip())
         title = "STRM媒体信息预热"
         if failed and not success:
@@ -1031,7 +1057,7 @@ class StrmPrewarmer(_PluginBase):
                 row([
                     text("max_bitrate", "探测码率上限", "200000000", "PlaybackInfo 请求参数"),
                     text("deep_lookup_limit", "深度查找上限", "20000", "深度查找最多遍历的条目数"),
-                    text("history_count", "历史保留条数", "200"),
+                    text("dedup_window", "去重窗口（秒）", "600", "窗口内同一条目不重复预热"),
                 ]),
                 row([{
                     "component": "VCol",
@@ -1096,7 +1122,7 @@ class StrmPrewarmer(_PluginBase):
             "onlyonce": False,
             "deep_lookup": True,
             "deep_lookup_limit": 20000,
-            "history_count": 200,
+            "dedup_window": 600,
             "max_bitrate": 200000000,
             "path_mappings": "",
             "scan_roots": "",

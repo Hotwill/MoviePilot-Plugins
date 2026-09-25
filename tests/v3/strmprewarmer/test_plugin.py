@@ -289,7 +289,7 @@ def test_collect_scan_targets_filters_roots_and_extension():
     ]]
     instance._query_items = lambda service, params: pages.pop(0) if pages else []
     targets = instance._collect_scan_targets(_service(), "Emby")
-    assert [item["Id"] for item, _ in targets] == ["1"]
+    assert [(item["Id"], reason) for item, reason in targets] == [("1", "incomplete")]
 
 
 def test_collect_scan_targets_respects_max_items():
@@ -632,7 +632,7 @@ def test_handle_task_skips_duplicate_trigger():
     instance.__class__.service_infos = property(lambda self: {"Emby": service})
     try:
         instance._locate_item = lambda svc, task, title: item
-        instance._process_target = lambda name, svc, it, title, source, force=False: (
+        instance._process_target = lambda name, svc, it, title, source, reason=None: (
             processed.append(it["Id"]) or {"status": "success", "title": title, "detail": ""})
         instance._handle_task({"path": "/data/media/a.strm", "path_side": "emby", "source": "入库"})
         instance._handle_task({"item_id": "42", "source": "Webhook"})
@@ -647,3 +647,44 @@ def test_notify_treats_changed_as_success():
     instance._notify_records([{"status": "changed", "title": "A", "detail": "换源重新预热 1920x1080"}])
     assert len(instance.messages) == 1
     assert "🔄" in instance.messages[0]["text"]
+
+
+def test_collect_scan_targets_marks_changed_reason(tmp_path):
+    """指纹变化的条目应标记为 changed。"""
+    strm = tmp_path / "e.strm"
+    strm.write_text("new", encoding="utf-8")
+    instance = _plugin(path_mappings=f"{tmp_path} => /data/media")
+    instance.save_data("fingerprints", {"5": {"path": "/data/media/e.strm",
+                                             "signature": {"status": "ok", "size": 1, "sha256": "old"}}})
+    pages = [[{"Id": "5", "Path": "/data/media/e.strm", "MediaSources": [{"MediaStreams": [
+        {"Type": "Video", "Codec": "h264", "Width": 1920, "Height": 1080}]}]}]]
+    instance._query_items = lambda service, params: pages.pop(0) if pages else []
+    targets = instance._collect_scan_targets(_service(), "Emby")
+    assert [reason for _, reason in targets] == ["changed"]
+
+
+def test_process_target_changed_reason_refreshes_first():
+    """调用方传入 changed 时应先刷新条目再预热。"""
+    instance = _plugin()
+    order = []
+    instance._trigger_refresh = lambda service, item_id=None: order.append(("refresh", item_id))
+    instance._prewarm = lambda service, item_id: (order.append(("prewarm", item_id)), (True, "1920x1080"))[1]
+    item = {"Id": "5", "Path": "/data/media/e.strm", "Name": "E",
+            "MediaSources": [{"MediaStreams": [
+                {"Type": "Video", "Codec": "h264", "Width": 1920, "Height": 1080}]}]}
+    record = instance._process_target("Emby", _service(), item, "E", "定时", reason="changed")
+    assert order == [("refresh", "5"), ("prewarm", "5")]
+    assert record["status"] == "changed"
+
+
+def test_process_target_incomplete_reason_skips_check():
+    """调用方传入 incomplete 时直接预热，不再判断完整性。"""
+    instance = _plugin()
+    calls = []
+    instance._prewarm = lambda service, item_id: (calls.append(item_id), (True, "1920x1080"))[1]
+    complete_item = {"Id": "6", "Path": "/data/media/f.strm", "Name": "F",
+                     "MediaSources": [{"MediaStreams": [
+                         {"Type": "Video", "Codec": "h264", "Width": 1920, "Height": 1080}]}]}
+    record = instance._process_target("Emby", _service(), complete_item, "F", "定时", reason="incomplete")
+    assert calls == ["6"]
+    assert record["status"] == "success"

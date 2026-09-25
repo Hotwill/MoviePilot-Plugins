@@ -589,8 +589,12 @@ class StrmPrewarmer(_PluginBase):
         return None
 
     def _process_target(self, service_name: str, service: ServiceInfo, item: dict,
-                        title: str, source: str, force: bool = False) -> dict:
-        """对单个条目执行预热，返回历史记录。"""
+                        title: str, source: str, reason: str = None) -> dict:
+        """对单个条目执行预热，返回历史记录。
+
+        reason 为 None 时自行判断是否需要预热；``incomplete`` 表示调用方已确认
+        媒体信息缺失；``changed`` 表示 STRM 换源，需要先刷新条目再预热。
+        """
         item_id = str(item.get("Id"))
         item_path = item.get("Path") or ""
         display = title or item.get("Name") or item_path
@@ -607,7 +611,13 @@ class StrmPrewarmer(_PluginBase):
             "detail": "",
         }
 
-        if has_complete_mediainfo(item) and not force:
+        if reason == "changed":
+            # 调用方已确认换源，先刷新条目让 Emby 丢弃旧的媒体信息
+            logger.info(f"{display} STRM 源已变更，重新刷新并预热")
+            record["changed"] = True
+            self._trigger_refresh(service, item_id)
+            self._stop_event.wait(2)
+        elif reason is None and has_complete_mediainfo(item):
             fingerprints = self._fingerprints()
             previous = (fingerprints.get(item_id) or {}).get("signature")
             if signature.get("status") != "ok" or previous is None or previous == signature:
@@ -835,7 +845,7 @@ class StrmPrewarmer(_PluginBase):
             for name, service in services.items():
                 targets = self._collect_scan_targets(service, name)
                 logger.info(f"{name} 待预热 STRM 条目 {len(targets)} 个")
-                for index, (item, force) in enumerate(targets, 1):
+                for index, (item, reason) in enumerate(targets, 1):
                     if self._stop_event.is_set():
                         break
                     key = (name, str(item.get("Id")))
@@ -845,7 +855,7 @@ class StrmPrewarmer(_PluginBase):
                         self._inflight.add(key)
                     try:
                         records.append(self._process_target(
-                            name, service, item, item.get("Name") or "", source, force=force))
+                            name, service, item, item.get("Name") or "", source, reason=reason))
                     finally:
                         with self._lock:
                             self._inflight.discard(key)
@@ -860,9 +870,9 @@ class StrmPrewarmer(_PluginBase):
             if handled:
                 self._notify_records(handled, summary=True)
 
-    def _collect_scan_targets(self, service: ServiceInfo, service_name: str) -> List[Tuple[dict, bool]]:
-        """分页扫描媒体库，返回需要预热的条目和是否强制预热。"""
-        targets: List[Tuple[dict, bool]] = []
+    def _collect_scan_targets(self, service: ServiceInfo, service_name: str) -> List[Tuple[dict, str]]:
+        """分页扫描媒体库，返回需要预热的条目及原因（incomplete / changed）。"""
+        targets: List[Tuple[dict, str]] = []
         fingerprints = self._fingerprints()
         baseline = {}
         start, page = 0, 500
@@ -878,7 +888,7 @@ class StrmPrewarmer(_PluginBase):
                     continue
                 item_id = str(item.get("Id"))
                 if not has_complete_mediainfo(item):
-                    targets.append((item, True))
+                    targets.append((item, "incomplete"))
                     continue
                 signature = file_fingerprint(self._local_path(item_path))
                 if signature.get("status") != "ok":
@@ -887,7 +897,7 @@ class StrmPrewarmer(_PluginBase):
                 if previous is None:
                     baseline[item_id] = {"path": item_path, "signature": signature}
                 elif previous != signature:
-                    targets.append((item, True))
+                    targets.append((item, "changed"))
                 if self._max_items and len(targets) >= self._max_items:
                     break
             if self._max_items and len(targets) >= self._max_items:

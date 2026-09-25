@@ -58,6 +58,10 @@ python3 -m pytest tests/v3 -q
 # 校验插件对宿主的导入在真实 MoviePilot 源码中可解析（V2/V3 各一份源码）
 python3 scripts/check_host_imports.py /path/to/MoviePilot-v3 /path/to/MoviePilot-v2
 
+# 真实宿主加载测试（需要一份 MoviePilot V3 源码；必须与 tests/v3 分开进程运行）
+pip install -r tests/host/requirements.txt
+MOVIEPILOT_BACKEND_PATH=/path/to/MoviePilot python3 -m pytest tests/host -q
+
 # 发布到 GitHub（需先 gh auth login，或已手动创建空仓库）
 bash scripts/publish.sh
 ```

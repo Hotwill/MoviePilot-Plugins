@@ -49,3 +49,23 @@ jobs:
 
       - name: Verify host imports resolve in both generations
         run: python scripts/check_host_imports.py /tmp/mp-v3 /tmp/mp-v2
+
+  host-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout MoviePilot V3
+        run: git clone --depth 1 https://github.com/jxxghp/MoviePilot.git /tmp/mp-v3
+
+      - name: Install minimal backend dependencies
+        run: pip install -r tests/host/requirements.txt
+
+      - name: Real host load test
+        env:
+          MOVIEPILOT_BACKEND_PATH: /tmp/mp-v3
+        run: python -m pytest tests/host -q

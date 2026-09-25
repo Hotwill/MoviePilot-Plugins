@@ -17,12 +17,17 @@ from apscheduler.triggers.cron import CronTrigger
 
 # 宿主导入：优先使用 V3 稳定 SDK，找不到时回退 V2 旧路径，
 # 使同一份实现可以在 MoviePilot V2 与 V3 宿主中运行。
+# 只有「SDK 模块本身不存在」才回退；若是宿主第三方依赖缺失，
+# 直接抛出原始错误，避免掩盖真实问题后在旧路径上报出误导性异常。
 try:  # MoviePilot V3
     from app.sdk.events import Event, eventmanager
     from app.sdk.logging import logger
     from app.sdk.network import RequestUtils
     from app.sdk.services import MediaServerHelper
-except ImportError:  # MoviePilot V2
+except ImportError as _sdk_error:  # MoviePilot V2
+    _missing = getattr(_sdk_error, "name", "") or ""
+    if not (_missing.startswith("app.sdk") or "app.sdk" in str(_sdk_error)):
+        raise
     from app.core.event import Event, eventmanager
     from app.log import logger
     from app.utils.http import RequestUtils

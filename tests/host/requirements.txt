@@ -1,0 +1,30 @@
+# 真实宿主加载测试所需的最小依赖集合（不是插件运行依赖）。
+# 通过在 MoviePilot V3 源码树上反复尝试导入插件逐步收敛得到，
+# 只覆盖 app.sdk.plugin / app.sdk.network / app.testing.bootstrap 的导入链。
+pytest==8.3.4
+aiofiles==25.1.0
+aioshutil==1.6
+alembic==1.14.1
+anitopy==2.1.1
+APScheduler==3.11.0
+bcrypt==4.2.1
+cachetools==5.5.1
+chardet==5.2.0
+click==8.1.8
+cn2an==0.5.23
+cryptography==44.0.1
+dateparser==1.2.1
+greenlet==3.1.1
+httpx==0.28.1
+Jinja2==3.1.5
+lxml==5.3.1
+psutil==6.1.1
+pycryptodome==3.21.0
+pydantic-settings==2.7.1
+PyJWT==2.10.1
+pyparsing==3.2.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.0.1
+redis==5.2.1
+requests==2.32.3
+SQLAlchemy==2.0.38

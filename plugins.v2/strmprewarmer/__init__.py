@@ -39,8 +39,24 @@ except ImportError:  # V2 使用 NotificationType
 
 # Emby 中需要探测媒体信息的条目类型
 ITEM_TYPES = "Movie,Episode,Video"
+# 可以执行 PlaybackInfo 探测的条目类型集合
+PLAYABLE_TYPES = {"Movie", "Episode", "Video", "MusicVideo"}
 # 查询条目时需要返回的字段
 ITEM_FIELDS = "Path,MediaSources,MediaStreams"
+
+
+def is_playable(item: dict) -> bool:
+    """判断条目是否是可以执行媒体探测的单个视频条目。
+
+    Emby Webhook 在剧集入库时返回的是剧集（Series）ID，对这类条目执行
+    PlaybackInfo 没有意义，必须按文件路径重新定位到具体分集。
+    """
+    if not item:
+        return False
+    item_type = item.get("Type")
+    if item_type and item_type not in PLAYABLE_TYPES:
+        return False
+    return bool(item.get("Path"))
 
 
 def normalize_base_url(host: str) -> str:
@@ -227,6 +243,8 @@ class StrmPrewarmer(_PluginBase):
         self._timeout = 300
         self._max_bitrate = 200000000
         self._refresh_missing = False
+        self._deep_lookup = True
+        self._deep_lookup_limit = 20000
         self._cron = ""
         self._onlyonce = False
         self._scan_roots: Tuple[str, ...] = ()
@@ -262,6 +280,8 @@ class StrmPrewarmer(_PluginBase):
         self._timeout = max(30, self._to_int(config.get("timeout"), 300))
         self._max_bitrate = self._to_int(config.get("max_bitrate"), 200000000)
         self._refresh_missing = bool(config.get("refresh_missing"))
+        self._deep_lookup = bool(config.get("deep_lookup", True))
+        self._deep_lookup_limit = max(500, self._to_int(config.get("deep_lookup_limit"), 20000))
         self._cron = (config.get("cron") or "").strip()
         self._onlyonce = bool(config.get("onlyonce"))
         self._scan_roots = parse_roots(config.get("scan_roots"))
@@ -326,6 +346,8 @@ class StrmPrewarmer(_PluginBase):
             "timeout": self._timeout,
             "max_bitrate": self._max_bitrate,
             "refresh_missing": self._refresh_missing,
+            "deep_lookup": self._deep_lookup,
+            "deep_lookup_limit": self._deep_lookup_limit,
             "cron": self._cron,
             "onlyonce": False,
             "scan_roots": "\n".join(self._scan_roots),
@@ -461,6 +483,26 @@ class StrmPrewarmer(_PluginBase):
                 only_path = items[0]["Path"].replace("\\", "/").lower()
                 if Path(only_path).name == Path(target).name:
                     return items[0]
+        if self._deep_lookup:
+            return self._find_item_by_scan(service, target)
+        return None
+
+    def _find_item_by_scan(self, service: ServiceInfo, target: str) -> Optional[dict]:
+        """分页遍历媒体库按路径匹配条目，兜底老版本 Emby 不支持 Path 过滤的情况。"""
+        start, page, scanned = 0, 500, 0
+        while scanned < self._deep_lookup_limit and not self._stop_event.is_set():
+            items = self._query_items(service, {
+                "StartIndex": str(start), "Limit": str(page), "Fields": "Path"})
+            if not items:
+                return None
+            for item in items:
+                if (item.get("Path") or "").replace("\\", "/").lower() == target:
+                    # 遍历时只取了 Path 字段，需要回查完整详情
+                    return self._fetch_item(service, str(item.get("Id"))) or item
+            scanned += len(items)
+            if len(items) < page:
+                return None
+            start += page
         return None
 
     def _trigger_refresh(self, service: ServiceInfo, item_id: str = None) -> None:
@@ -612,8 +654,29 @@ class StrmPrewarmer(_PluginBase):
             finally:
                 self._queue.task_done()
 
+    def _locate_item(self, service: ServiceInfo, task: dict, title: str) -> Optional[dict]:
+        """定位任务对应的 Emby 条目。
+
+        优先按文件路径定位：Emby Webhook 在剧集入库时给出的 item_id 是剧集 ID，
+        只有路径才能唯一定位到具体分集。条目 ID 仅作为路径不可用时的回退。
+        """
+        raw_path = task.get("path")
+        if raw_path:
+            # 入库事件给出的是 MoviePilot 侧路径，需要映射；Webhook 给出的已是 Emby 侧路径
+            emby_path = raw_path if task.get("path_side") == "emby" else self._emby_path(raw_path)
+            item = self._wait_for_item(service, emby_path, title)
+            if item:
+                return item
+        if task.get("item_id"):
+            candidate = self._fetch_item(service, str(task["item_id"]))
+            if is_playable(candidate):
+                return candidate
+            if candidate:
+                logger.debug(f"条目 {task['item_id']} 类型为 {candidate.get('Type')}，不能直接探测")
+        return None
+
     def _handle_task(self, task: dict) -> None:
-        """处理单个入库预热任务：等待识别 -> 预热 -> 记录。"""
+        """处理单个入库预热任务：定位条目 -> 预热 -> 记录。"""
         delay = self._delay if task.get("delay") is None else self._to_int(task.get("delay"), self._delay)
         if delay > 0 and self._stop_event.wait(delay):
             return
@@ -625,15 +688,10 @@ class StrmPrewarmer(_PluginBase):
         for name, service in services.items():
             if task.get("server") and task.get("server") != name:
                 continue
-            item = None
-            if task.get("item_id"):
-                item = self._fetch_item(service, str(task["item_id"]))
-            if not item and task.get("path"):
-                emby_path = self._emby_path(task["path"])
-                item = self._wait_for_item(service, emby_path, title)
+            item = self._locate_item(service, task, title)
             if not item:
-                if task.get("path"):
-                    logger.warning(f"{title or task.get('path')} 在 {name} 中未找到对应条目，已跳过预热")
+                logger.warning(f"{title or task.get('path') or task.get('item_id')} "
+                               f"在 {name} 中未找到可探测的条目，已跳过预热")
                 continue
             if self._only_strm and not is_strm(item.get("Path") or ""):
                 logger.debug(f"{item.get('Path')} 不是 STRM 文件，按配置跳过")
@@ -662,6 +720,7 @@ class StrmPrewarmer(_PluginBase):
             self._queue.put({
                 "type": "path",
                 "path": path,
+                "path_side": "local",
                 "title": title,
                 "source": source,
                 "server": server,
@@ -714,9 +773,11 @@ class StrmPrewarmer(_PluginBase):
             "type": "item",
             "item_id": str(item_id) if item_id else None,
             "path": str(item_path) if item_path else None,
+            "path_side": "emby",
             "title": getattr(event_info, "item_name", "") or "",
             "source": "Webhook",
             "server": getattr(event_info, "server_name", None),
+            "delay": 0,
         })
         logger.info(f"Webhook 新增入库，已加入预热队列：{getattr(event_info, 'item_name', '') or item_id}")
 
@@ -965,7 +1026,12 @@ class StrmPrewarmer(_PluginBase):
                 row([
                     switch("refresh_missing", "找不到时扫描媒体库", "未找到条目时请求 Emby 扫描"),
                     switch("onlyonce", "立即运行一次", "保存后立即执行一次全量扫描"),
-                    text("max_bitrate", "探测码率上限", "200000000", "PlaybackInfo 请求参数", cols=4),
+                    switch("deep_lookup", "深度查找条目", "Path 查询不可用时遍历媒体库匹配路径"),
+                ]),
+                row([
+                    text("max_bitrate", "探测码率上限", "200000000", "PlaybackInfo 请求参数"),
+                    text("deep_lookup_limit", "深度查找上限", "20000", "深度查找最多遍历的条目数"),
+                    text("history_count", "历史保留条数", "200"),
                 ]),
                 row([{
                     "component": "VCol",
@@ -1028,6 +1094,9 @@ class StrmPrewarmer(_PluginBase):
             "item_interval": 1,
             "refresh_missing": False,
             "onlyonce": False,
+            "deep_lookup": True,
+            "deep_lookup_limit": 20000,
+            "history_count": 200,
             "max_bitrate": 200000000,
             "path_mappings": "",
             "scan_roots": "",

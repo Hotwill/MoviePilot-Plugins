@@ -17,7 +17,7 @@ STRM 入库后立即通过 Emby 的 `PlaybackInfo` 接口触发真实媒体探�
 | 触发源 | 说明 |
 | --- | --- |
 | 整理入库事件 | MoviePilot 整理完成（`TransferComplete`）后按目标文件路径预热 |
-| 媒体库 Webhook | Emby `library.new` 事件（需在 Emby 中配置 MoviePilot Webhook）直接按条目 ID 预热 |
+| 媒体库 Webhook | Emby `library.new` 事件（需在 Emby 中配置 MoviePilot Webhook），按文件路径定位分集后预热 |
 | 定时扫描 | 按 Cron 周期全量扫描，补齐缺失媒体信息、识别换源 |
 | 远程命令 | 交互消息发送 `/strm_prewarm` 手动触发一次全量扫描 |
 
@@ -44,6 +44,9 @@ STRM 入库后立即通过 Emby 的 `PlaybackInfo` 接口触发真实媒体探�
 | 单次最多处理 | 0 | 0 表示不限制，低配机器可设为 100 |
 | 条目间隔（秒） | 1 | 全量扫描时每个条目之间的等待时间 |
 | 找不到时扫描媒体库 | 关 | 未找到条目时请求 Emby 扫描媒体库 |
+| 深度查找条目 | 开 | 老版本 Emby 不支持 `Path` 查询时，遍历媒体库按路径匹配 |
+| 深度查找上限 | 20000 | 深度查找最多遍历的条目数 |
+| 历史保留条数 | 200 | 详情页保留的记录数量 |
 | 立即运行一次 | 关 | 保存后立刻执行一次全量扫描 |
 | 探测码率上限 | 200000000 | `PlaybackInfo` 的 `MaxStreamingBitrate` 参数 |
 | 路径映射 | 空 | `MoviePilot 路径 => Emby 路径`，每行一条 |
@@ -69,7 +72,7 @@ STRM 入库
    ↓
 （等待）Emby 扫描到新条目
    ↓
-Items 查询定位条目（Path 过滤，失败回退文件名搜索）
+Items 查询定位条目（Path 过滤 → 文件名搜索 → 分页遍历兜底）
    ↓
 POST /emby/Items/{id}/PlaybackInfo (IsPlayback=true)
    ↓

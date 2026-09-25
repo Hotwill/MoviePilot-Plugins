@@ -483,3 +483,112 @@ def test_command_declaration():
     command = plugin_module.StrmPrewarmer.get_command()[0]
     assert command["cmd"] == "/strm_prewarm"
     assert command["data"] == {"action": "strm_prewarm"}
+
+
+def test_is_playable_rejects_series():
+    """剧集/季条目不能直接执行媒体探测。"""
+    assert plugin_module.is_playable({"Type": "Episode", "Path": "/a/b.strm"})
+    assert plugin_module.is_playable({"Type": "Movie", "Path": "/a/b.strm"})
+    assert not plugin_module.is_playable({"Type": "Series", "Path": "/a"})
+    assert not plugin_module.is_playable({"Type": "Season", "Path": "/a"})
+    assert not plugin_module.is_playable({"Type": "Movie"})
+    assert not plugin_module.is_playable(None)
+
+
+def test_locate_item_prefers_path_over_series_id():
+    """Webhook 剧集事件给的是剧集 ID，应按路径定位到分集。"""
+    instance = _plugin()
+    episode = {"Id": "ep1", "Type": "Episode", "Path": "/data/media/tv/s01e01.strm"}
+    series = {"Id": "series1", "Type": "Series", "Path": "/data/media/tv"}
+    instance._wait_for_item = lambda service, path, title: episode if path == episode["Path"] else None
+    instance._fetch_item = lambda service, item_id: series
+    task = {"item_id": "series1", "path": episode["Path"], "path_side": "emby"}
+    assert instance._locate_item(_service(), task, "剧集 S01E01")["Id"] == "ep1"
+
+
+def test_locate_item_rejects_series_when_path_missing():
+    """路径不可用且条目是剧集时不应返回条目。"""
+    instance = _plugin()
+    instance._fetch_item = lambda service, item_id: {"Id": "series1", "Type": "Series", "Path": "/data/tv"}
+    assert instance._locate_item(_service(), {"item_id": "series1"}, "剧集") is None
+
+
+def test_locate_item_accepts_movie_by_id():
+    """电影 Webhook 给的是条目本身，允许按 ID 定位。"""
+    instance = _plugin()
+    movie = {"Id": "m1", "Type": "Movie", "Path": "/data/media/movies/a.strm"}
+    instance._fetch_item = lambda service, item_id: movie
+    assert instance._locate_item(_service(), {"item_id": "m1"}, "电影")["Id"] == "m1"
+
+
+def test_locate_item_maps_local_path_for_transfer_tasks():
+    """入库任务的路径需要按映射转换成 Emby 路径。"""
+    instance = _plugin(path_mappings="/media/strm => /data/media")
+    seen = []
+
+    def wait(service, path, title):
+        """记录查找时使用的路径。"""
+        seen.append(path)
+        return {"Id": "1", "Type": "Movie", "Path": path}
+
+    instance._wait_for_item = wait
+    instance._locate_item(_service(), {"path": "/media/strm/a.strm", "path_side": "local"}, "A")
+    assert seen == ["/data/media/a.strm"]
+
+
+def test_find_item_by_path_falls_back_to_deep_scan():
+    """Path 查询与搜索都失败时使用深度遍历兜底。"""
+    instance = _plugin()
+    target = {"Id": "7", "Path": "/data/media/deep.strm"}
+    calls = []
+
+    def query(service, params):
+        """模拟 Path/SearchTerm 查询为空，分页遍历命中。"""
+        calls.append(params)
+        if "StartIndex" in params:
+            return [target] if params["StartIndex"] == "0" else []
+        return []
+
+    instance._query_items = query
+    instance._fetch_item = lambda service, item_id: dict(target, Type="Movie")
+    found = instance._find_item_by_path(_service(), "/data/media/deep.strm")
+    assert found["Id"] == "7"
+    assert any("StartIndex" in params for params in calls)
+
+
+def test_find_item_by_path_deep_scan_can_be_disabled():
+    """关闭深度查找后不应执行分页遍历。"""
+    instance = _plugin(deep_lookup=False)
+    calls = []
+
+    def query(service, params):
+        """记录查询参数。"""
+        calls.append(params)
+        return []
+
+    instance._query_items = query
+    assert instance._find_item_by_path(_service(), "/data/media/deep.strm") is None
+    assert not any("StartIndex" in params for params in calls)
+
+
+def test_webhook_task_marks_emby_path_and_zero_delay():
+    """Webhook 任务应标记 Emby 侧路径且不再延迟等待。"""
+    instance = _plugin()
+    instance._enabled = True
+    event_info = types.SimpleNamespace(channel="emby", event="library.new", item_id="55",
+                                       item_path="/data/media/a.strm", item_name="A", server_name="Emby")
+    instance.on_webhook_message(types.SimpleNamespace(event_data=event_info))
+    task = instance._queue.get_nowait()
+    assert task["path_side"] == "emby"
+    assert task["delay"] == 0
+
+
+def test_transfer_task_marks_local_path():
+    """入库任务应标记 MoviePilot 侧路径。"""
+    instance = _plugin()
+    instance._enabled = True
+    transferinfo = types.SimpleNamespace(
+        target_item=types.SimpleNamespace(path="/media/strm/a.strm"), file_list_new=[])
+    event = types.SimpleNamespace(event_data={"transferinfo": transferinfo, "mediainfo": None})
+    instance.on_transfer_complete(event)
+    assert instance._queue.get_nowait()["path_side"] == "local"

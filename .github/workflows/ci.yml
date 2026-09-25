@@ -69,3 +69,23 @@ jobs:
         env:
           MOVIEPILOT_BACKEND_PATH: /tmp/mp-v3
         run: python -m pytest tests/host -q
+
+  host-load-v2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Checkout MoviePilot V2
+        run: git clone --depth 1 -b v2 https://github.com/jxxghp/MoviePilot.git /tmp/mp-v2
+
+      - name: Install minimal backend dependencies
+        run: pip install -r tests/hostv2/requirements.txt
+
+      - name: Real V2 host load test
+        env:
+          MOVIEPILOT_V2_BACKEND_PATH: /tmp/mp-v2
+        run: python -m pytest tests/hostv2 -q

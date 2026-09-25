@@ -62,6 +62,10 @@ python3 scripts/check_host_imports.py /path/to/MoviePilot-v3 /path/to/MoviePilot
 pip install -r tests/host/requirements.txt
 MOVIEPILOT_BACKEND_PATH=/path/to/MoviePilot python3 -m pytest tests/host -q
 
+# 真实 V2 宿主加载测试（需要一份 MoviePilot v2 分支源码）
+pip install -r tests/hostv2/requirements.txt
+MOVIEPILOT_V2_BACKEND_PATH=/path/to/MoviePilot-v2 python3 -m pytest tests/hostv2 -q
+
 # 发布到 GitHub（需先 gh auth login，或已手动创建空仓库）
 bash scripts/publish.sh
 ```

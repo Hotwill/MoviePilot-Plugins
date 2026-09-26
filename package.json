@@ -13,5 +13,20 @@
     },
     "v2": true,
     "v3": true
+  },
+  "LibraryMirror": {
+    "name": "媒体库云盘镜像",
+    "description": "入库后把媒体库文件按相同目录结构再复制一份到OpenList/AList等云盘，实现本地与云盘双写。",
+    "labels": "媒体库,云盘,OpenList",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/librarymirror.png",
+    "author": "Hotwill",
+    "level": 1,
+    "release": false,
+    "history": {
+      "v1.0.0": "首次发布：入库后按媒体库目录结构镜像到云盘，支持覆盖策略、刮削与字幕同步、定时补漏扫描与外部触发接口。"
+    },
+    "v2": true,
+    "v3": true
   }
 }

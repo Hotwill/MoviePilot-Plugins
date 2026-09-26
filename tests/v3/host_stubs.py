@@ -7,6 +7,7 @@
 import enum
 import sys
 import types
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
@@ -98,6 +99,105 @@ class _FakePluginBase:
         self.messages.append(kwargs)
 
 
+class _FakeFileItem:
+    """最小文件项替身，字段与宿主 FileItem 的常用部分一致。"""
+
+    def __init__(self, storage: str = "local", type: str = "file", path: str = None,
+                 name: str = None, size: int = None, **kwargs: Any) -> None:
+        self.storage = storage
+        self.type = type
+        self.path = path
+        self.name = name
+        self.size = size
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __repr__(self) -> str:
+        """便于断言失败时阅读。"""
+        return f"FileItem(storage={self.storage!r}, path={self.path!r}, size={self.size!r})"
+
+
+class _FakeStorageChain:
+    """记录云盘操作的假存储链，测试可预置文件与失败行为。"""
+
+    # 云盘上已存在的文件：path -> size
+    remote_files: Dict[str, int] = {}
+    # 调用记录
+    calls: list = []
+    # 上传是否失败
+    upload_fails: int = 0
+    # get_folder 是否失败
+    folder_fails: bool = False
+
+    @classmethod
+    def reset(cls) -> None:
+        """清空状态，供每个用例独立使用。"""
+        cls.remote_files = {}
+        cls.calls = []
+        cls.upload_fails = 0
+        cls.folder_fails = False
+
+    def get_file_item(self, storage: str, path: Any) -> Optional[_FakeFileItem]:
+        """查询云盘文件。"""
+        key = str(path)
+        self.calls.append(("get_file_item", storage, key))
+        if key not in self.remote_files:
+            return None
+        return _FakeFileItem(storage=storage, path=key, name=key.rsplit("/", 1)[-1],
+                             size=self.remote_files[key])
+
+    def get_folder(self, storage: str, path: Any) -> Optional[_FakeFileItem]:
+        """获取或创建云盘目录。"""
+        key = str(path)
+        self.calls.append(("get_folder", storage, key))
+        if self.folder_fails:
+            return None
+        return _FakeFileItem(storage=storage, type="dir", path=key, name=key.rsplit("/", 1)[-1])
+
+    def upload_file(self, fileitem: Any, path: Any, new_name: str = None) -> Optional[_FakeFileItem]:
+        """上传文件到云盘目录。"""
+        target = f"{fileitem.path.rstrip('/')}/{new_name or Path(str(path)).name}"
+        self.calls.append(("upload_file", fileitem.storage, target, str(path)))
+        if _FakeStorageChain.upload_fails > 0:
+            _FakeStorageChain.upload_fails -= 1
+            return None
+        try:
+            size = Path(str(path)).stat().st_size
+        except OSError:
+            size = 0
+        self.remote_files[target] = size
+        return _FakeFileItem(storage=fileitem.storage, path=target,
+                             name=target.rsplit("/", 1)[-1], size=size)
+
+    def download_file(self, fileitem: Any, path: Any = None) -> Optional[Any]:
+        """把远端文件下载到本地临时路径。"""
+        self.calls.append(("download_file", fileitem.storage, str(fileitem.path)))
+        target = Path(str(path))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"remote-content")
+        return target
+
+
+class _FakeStorageHelper:
+    """返回测试注入的存储配置。"""
+
+    storagies: list = []
+
+    def get_storagies(self) -> list:
+        """返回存储配置列表。"""
+        return list(self.storagies)
+
+
+class _FakeDirectoryHelper:
+    """返回测试注入的目录配置。"""
+
+    dirs: list = []
+
+    def get_dirs(self) -> list:
+        """返回目录配置列表。"""
+        return list(self.dirs)
+
+
 class _FakeMediaServerHelper:
     """返回测试注入的媒体服务器服务。"""
 
@@ -115,8 +215,15 @@ class _FakeMediaServerHelper:
         return dict(self.configs)
 
 
+# 进程内只安装一次：重复安装会替换事件管理器，导致已导入的插件注册信息丢失
+_INSTALLED: Optional[types.SimpleNamespace] = None
+
+
 def install_stubs() -> types.SimpleNamespace:
-    """注入宿主桩模块并返回测试可用的句柄。"""
+    """注入宿主桩模块并返回测试可用的句柄（幂等）。"""
+    global _INSTALLED
+    if _INSTALLED is not None:
+        return _INSTALLED
     event_manager = _FakeEventManager()
 
     def module(name: str, **attrs: Any) -> types.ModuleType:
@@ -134,13 +241,23 @@ def install_stubs() -> types.SimpleNamespace:
         info=lambda *a, **k: None, warning=lambda *a, **k: None,
         error=lambda *a, **k: None, debug=lambda *a, **k: None, warn=lambda *a, **k: None))
     module("app.sdk.network", RequestUtils=_FakeRequestUtils)
-    module("app.sdk.services", MediaServerHelper=_FakeMediaServerHelper)
+    module("app.sdk.services", MediaServerHelper=_FakeMediaServerHelper,
+           StorageHelper=_FakeStorageHelper)
     module("app.plugins", _PluginBase=_FakePluginBase)
-    module("app.schemas", ServiceInfo=object)
+    module("app.chain", )
+    module("app.chain.storage", StorageChain=_FakeStorageChain)
+    module("app.application", )
+    module("app.application.directory", DirectoryHelper=_FakeDirectoryHelper)
+    module("app.schemas", ServiceInfo=object, FileItem=_FakeFileItem)
     module("app.schemas.types", EventType=_FakeEnum, MessageType=_FakeEnum)
-    return types.SimpleNamespace(
+    _INSTALLED = types.SimpleNamespace(
         event_manager=event_manager,
         request_utils=_FakeRequestUtils,
         media_server_helper=_FakeMediaServerHelper,
+        storage_chain=_FakeStorageChain,
+        storage_helper=_FakeStorageHelper,
+        directory_helper=_FakeDirectoryHelper,
+        file_item=_FakeFileItem,
         response=_FakeResponse,
     )
+    return _INSTALLED

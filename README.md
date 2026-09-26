@@ -24,6 +24,7 @@ MoviePilot 插件市场地址使用。
 | 插件 | 说明 | 版本 |
 | --- | --- | --- |
 | [STRM媒体信息预热](./plugins.v3/strmprewarmer/README.md) | STRM 入库后立即让 Emby 探测真实媒体信息 | 1.0.0 |
+| [媒体库云盘镜像](./plugins.v3/librarymirror/README.md) | 入库后按媒体库目录结构把文件再复制一份到 OpenList/AList | 1.0.0 |
 
 ## 仓库结构
 
@@ -32,9 +33,9 @@ MoviePilot-Plugins/
 ├── package.json             # V1 索引
 ├── package.v2.json          # V2 索引
 ├── package.v3.json          # V3 索引
-├── plugins/strmprewarmer/   # V1 宿主可加载的实现（与 V3 同源）
-├── plugins.v2/strmprewarmer/# V2 宿主实现（与 V3 同源）
-├── plugins.v3/strmprewarmer/# 插件源码，以此目录为准
+├── plugins/<插件>/          # V1 宿主可加载的实现（与 V3 同源）
+├── plugins.v2/<插件>/       # V2 宿主实现（与 V3 同源）
+├── plugins.v3/<插件>/       # 插件源码，以此目录为准
 ├── icons/                   # 插件图标
 ├── scripts/                 # 同步、宿主导入校验与发布脚本
 └── tests/v3/strmprewarmer/  # 单元测试

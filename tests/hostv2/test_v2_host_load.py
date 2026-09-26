@@ -12,7 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from conftest import BACKEND_PATH, PLUGINS_REPO
+from env import PLUGINS_REPO, resolve_backend
+
+BACKEND_PATH = resolve_backend()
 
 
 @pytest.fixture(scope="module")
@@ -97,7 +99,9 @@ def test_api_endpoints_on_v2(plugin):
     plugin.init_plugin({"enabled": True})
     status = plugin.api_status()
     assert status.success is True and status.data["enabled"] is True
+    # 后台线程会立刻消费队列，这里只断言接口契约，避免读队列产生竞态
     accepted = plugin.api_prewarm(path="/media/strm/a.strm")
     assert accepted.success is True
-    assert plugin._queue.get_nowait()["source"] == "API"
+    assert accepted.data["path"] == "/media/strm/a.strm"
+    assert plugin.api_prewarm(path="/media/a.mkv").success is False
     plugin.stop_service()

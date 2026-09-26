@@ -18,22 +18,8 @@ from pathlib import Path
 
 import pytest
 
-PLUGINS_REPO = Path(__file__).resolve().parents[2]
-
-
-def _resolve_backend() -> Path:
-    """定位 MoviePilot V2 源码目录。"""
-    candidates = []
-    env = os.environ.get("MOVIEPILOT_V2_BACKEND_PATH")
-    if env:
-        candidates.append(Path(env).expanduser())
-    candidates.append(PLUGINS_REPO.parent / "MoviePilot-v2")
-    for path in candidates:
-        if (path / "app" / "core" / "event.py").is_file():
-            return path
-    raise FileNotFoundError(
-        "未找到 MoviePilot V2 源码，请设置 MOVIEPILOT_V2_BACKEND_PATH 或放置在同级 MoviePilot-v2 目录"
-    )
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from env import PLUGINS_REPO, resolve_backend  # noqa: E402
 
 
 def _install_sites_stub() -> None:
@@ -62,7 +48,7 @@ if "app" in sys.modules and getattr(sys.modules["app"], "__file__", None) is Non
                 allow_module_level=True)
 
 try:
-    BACKEND_PATH = _resolve_backend()
+    BACKEND_PATH = resolve_backend()
 except FileNotFoundError as error:
     pytest.skip(f"跳过 V2 真实加载测试：{error}", allow_module_level=True)
 

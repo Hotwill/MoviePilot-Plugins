@@ -1,33 +1,15 @@
 """STRM 媒体信息预热插件单元测试。"""
 
-import importlib.util
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent))
-from host_stubs import install_stubs  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plugin_loader import STUBS, load_plugin  # noqa: E402
 
-STUBS = install_stubs()
-
-PLUGIN_PATH = Path(__file__).resolve().parents[3] / "plugins.v3" / "strmprewarmer" / "__init__.py"
-
-
-def _load_plugin_module():
-    """以固定模块名加载插件源码，避免重复注册副作用。"""
-    name = "app.plugins.strmprewarmer"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, PLUGIN_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-plugin_module = _load_plugin_module()
+plugin_module = load_plugin("strmprewarmer")
 
 
 def test_normalize_base_url_adds_scheme_and_slash():

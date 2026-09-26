@@ -16,8 +16,10 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 import requests
 
-sys.path.insert(0, str(Path(__file__).parent))
-from test_plugin import plugin_module  # noqa: E402  复用已加载的插件模块
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from plugin_loader import load_plugin  # noqa: E402
+
+plugin_module = load_plugin("strmprewarmer")
 
 INCOMPLETE = {"MediaSources": [{"MediaStreams": [{"Type": "Video", "Codec": "hevc"}]}]}
 COMPLETE = {"MediaSources": [{"MediaStreams": [

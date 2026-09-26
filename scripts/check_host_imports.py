@@ -18,19 +18,31 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_FILE = ROOT / "plugins.v3" / "strmprewarmer" / "__init__.py"
+PLUGINS_DIR = ROOT / "plugins.v3"
 
-# V3 优先使用的 SDK 导入；V2 宿主允许缺失
-V3_MODULES = {"app.sdk.events", "app.sdk.logging", "app.sdk.network", "app.sdk.services"}
+# V3 优先使用的导入；V2 宿主允许缺失
+V3_MODULES = {
+    "app.sdk.events", "app.sdk.logging", "app.sdk.network", "app.sdk.services",
+    "app.application.directory",
+}
 # V2 回退导入；V3 宿主通过兼容层承接
-V2_MODULES = {"app.core.event", "app.log", "app.utils.http", "app.helper.mediaserver"}
+V2_MODULES = {
+    "app.core.event", "app.log", "app.utils.http",
+    "app.helper.mediaserver", "app.helper.storage", "app.helper.directory",
+}
 # 两代宿主的消息类型枚举名不同，插件只需其中之一
 MESSAGE_TYPES = {"MessageType", "NotificationType"}
 
 
-def plugin_imports() -> List[Tuple[str, str]]:
+def plugin_files() -> List[Path]:
+    """列出所有 V3 插件源码文件。"""
+    return sorted(path / "__init__.py" for path in PLUGINS_DIR.iterdir()
+                  if path.is_dir() and (path / "__init__.py").exists())
+
+
+def plugin_imports(plugin_file: Path) -> List[Tuple[str, str]]:
     """从插件源码中收集所有 app.* 的 from-import 符号。"""
-    tree = ast.parse(PLUGIN_FILE.read_text(encoding="utf-8"))
+    tree = ast.parse(plugin_file.read_text(encoding="utf-8"))
     imports = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("app"):
@@ -144,13 +156,11 @@ def resolve(host: Path, module: str, symbol: str, compat: Dict[str, Set[str]]) -
     return False, "模块不存在"
 
 
-def check_host(host: Path) -> bool:
-    """校验单个宿主目录，返回是否通过。"""
-    compat = compat_symbols(host)
-    generation = "V3" if (host / "app" / "sdk").exists() else "V2"
-    print(f"\n== 宿主 {host}（判定为 {generation}）")
+def check_plugin(host: Path, plugin_file: Path, compat: Dict[str, Set[str]]) -> bool:
+    """校验单个插件在指定宿主中的导入，返回是否通过。"""
+    print(f"  -- 插件 {plugin_file.parent.name}")
     groups = {"V3 SDK": [], "V2 兼容": [], "消息类型": [], "公共": []}
-    for module, symbol in plugin_imports():
+    for module, symbol in plugin_imports(plugin_file):
         ok, how = resolve(host, module, symbol, compat)
         if module in V3_MODULES:
             group = "V3 SDK"
@@ -162,24 +172,32 @@ def check_host(host: Path) -> bool:
         else:
             group = "公共"
         groups[group].append((module, symbol, ok, how))
-        print(f"  [{'OK ' if ok else 'FAIL'}] {group:7} {module}.{symbol} -> {how}")
+        print(f"     [{'OK ' if ok else 'FAIL'}] {group:7} {module}.{symbol} -> {how}")
 
     shared_ok = all(ok for _, _, ok, _ in groups["公共"])
     message_ok = any(ok for _, _, ok, _ in groups["消息类型"])
     v3_ok = bool(groups["V3 SDK"]) and all(ok for _, _, ok, _ in groups["V3 SDK"])
     v2_ok = bool(groups["V2 兼容"]) and all(ok for _, _, ok, _ in groups["V2 兼容"])
     if not shared_ok:
-        print("  结果: 失败（公共导入无法解析）")
+        print("     结果: 失败（公共导入无法解析）")
         return False
     if not message_ok:
-        print("  结果: 失败（MessageType 与 NotificationType 都无法解析）")
+        print("     结果: 失败（MessageType 与 NotificationType 都无法解析）")
         return False
     if not (v3_ok or v2_ok):
-        print("  结果: 失败（两条导入分支都无法解析）")
+        print("     结果: 失败（两条导入分支都无法解析）")
         return False
     branch = "V3 SDK" if v3_ok else "V2 兼容"
-    print(f"  结果: 通过（使用 {branch} 分支，公共导入与消息类型均可解析）")
+    print(f"     结果: 通过（使用 {branch} 分支，公共导入与消息类型均可解析）")
     return True
+
+
+def check_host(host: Path) -> bool:
+    """校验单个宿主目录下的所有插件。"""
+    compat = compat_symbols(host)
+    generation = "V3" if (host / "app" / "sdk").exists() else "V2"
+    print(f"\n== 宿主 {host}（判定为 {generation}）")
+    return all(check_plugin(host, plugin_file, compat) for plugin_file in plugin_files())
 
 
 def main() -> int:

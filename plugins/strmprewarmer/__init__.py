@@ -202,6 +202,66 @@ def describe_mediainfo(item: dict) -> str:
     return " ".join(parts)
 
 
+def human_elapsed(seconds: float) -> str:
+    """把秒数格式化为易读文本。"""
+    if seconds < 60:
+        return f"{seconds:.1f}秒"
+    minutes, rest = divmod(int(seconds), 60)
+    return f"{minutes}分{rest}秒"
+
+
+def media_image(mediainfo: Any) -> str:
+    """取媒体图片地址，优先使用消息图（横版背景图）。"""
+    if not mediainfo:
+        return ""
+    for getter in ("get_message_image", "get_backdrop_image", "get_poster_image"):
+        method = getattr(mediainfo, getter, None)
+        if callable(method):
+            try:
+                image = method()
+            except Exception:
+                image = None
+            if image:
+                return str(image)
+    for attribute in ("backdrop_path", "poster_path"):
+        image = getattr(mediainfo, attribute, None)
+        if image:
+            return str(image)
+    return ""
+
+
+def describe_streams(item: dict) -> Dict[str, str]:
+    """把媒体流拆成分辨率、编码、码率、音轨等字段，便于排版展示。"""
+    video, audio, subtitle = None, [], []
+    for stream in media_streams(item or {}):
+        kind = stream.get("Type")
+        if kind == "Video" and not video:
+            video = stream
+        elif kind == "Audio":
+            audio.append(stream)
+        elif kind == "Subtitle":
+            subtitle.append(stream)
+    fields: Dict[str, str] = {}
+    if video:
+        if video.get("Width") and video.get("Height"):
+            fields["resolution"] = f"{video['Width']}x{video['Height']}"
+        if video.get("Codec"):
+            fields["codec"] = str(video["Codec"]).upper()
+        if video.get("BitRate"):
+            try:
+                fields["bitrate"] = f"{int(video['BitRate']) / 1000000:.1f}Mbps"
+            except (TypeError, ValueError):
+                pass
+        if video.get("VideoRange"):
+            fields["range"] = str(video["VideoRange"])
+    if audio:
+        codecs = [str(stream.get("Codec")).upper() for stream in audio if stream.get("Codec")]
+        fields["audio"] = f"{'/'.join(sorted(set(codecs)))}（{len(audio)}条）" if codecs else f"{len(audio)}条"
+    if subtitle:
+        fields["subtitle"] = f"{len(subtitle)}条"
+    return fields
+
+
 def file_fingerprint(local_path: Optional[str]) -> Dict[str, Any]:
     """计算 STRM 文件内容指纹，用于识别同名换源。"""
     if not local_path:
@@ -230,7 +290,7 @@ class StrmPrewarmer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/strmprewarmer.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Hotwill"
     # 作者主页
@@ -606,7 +666,8 @@ class StrmPrewarmer(_PluginBase):
         return None
 
     def _process_target(self, service_name: str, service: ServiceInfo, item: dict,
-                        title: str, source: str, reason: str = None) -> dict:
+                        title: str, source: str, reason: str = None,
+                        image: str = "") -> dict:
         """对单个条目执行预热，返回历史记录。
 
         reason 为 None 时自行判断是否需要预热；``incomplete`` 表示调用方已确认
@@ -626,6 +687,8 @@ class StrmPrewarmer(_PluginBase):
             "source": source,
             "status": "skip",
             "detail": "",
+            "image": image or "",
+            "filename": Path(item_path).name if item_path else "",
         }
 
         if reason == "changed":
@@ -660,7 +723,9 @@ class StrmPrewarmer(_PluginBase):
                 elapsed = time.time() - started
                 record["status"] = "changed" if record.get("changed") else "success"
                 prefix = "换源重新预热 " if record.get("changed") else ""
-                record["detail"] = f"{prefix}{message} 用时{elapsed:.1f}s".strip()
+                record["detail"] = f"{prefix}{message} 用时{human_elapsed(elapsed)}".strip()
+                record["elapsed"] = round(elapsed, 1)
+                record["media"] = describe_streams(self._fetch_item(service, item_id))
                 self._save_fingerprint(item_id, item_path, signature)
                 logger.info(f"预热成功 {display} {message} 用时{elapsed:.1f}s")
                 return record
@@ -743,7 +808,9 @@ class StrmPrewarmer(_PluginBase):
                     continue
                 self._inflight.add(key)
             try:
-                records.append(self._process_target(name, service, item, title, task.get("source") or "入库"))
+                records.append(self._process_target(name, service, item, title,
+                                                    task.get("source") or "入库",
+                                                    image=task.get("image") or ""))
             finally:
                 with self._lock:
                     self._inflight.discard(key)
@@ -767,7 +834,8 @@ class StrmPrewarmer(_PluginBase):
             window = self._dedup_window or 600
             self._recent = {item: at for item, at in self._recent.items() if now - at < window}
 
-    def _enqueue_paths(self, paths: List[str], title: str, source: str, server: str = None) -> None:
+    def _enqueue_paths(self, paths: List[str], title: str, source: str, server: str = None,
+                       image: str = "") -> None:
         """把待预热的文件路径放入任务队列。"""
         for path in paths:
             if not path:
@@ -781,6 +849,7 @@ class StrmPrewarmer(_PluginBase):
                 "title": title,
                 "source": source,
                 "server": server,
+                "image": image,
             })
             logger.info(f"已加入预热队列：{title or path}")
 
@@ -804,7 +873,7 @@ class StrmPrewarmer(_PluginBase):
                 paths.append(str(path))
         if not paths:
             return
-        self._enqueue_paths(paths, title, "入库")
+        self._enqueue_paths(paths, title, "入库", image=media_image(mediainfo))
 
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook_message(self, event: Event) -> None:
@@ -835,6 +904,7 @@ class StrmPrewarmer(_PluginBase):
             "source": "Webhook",
             "server": getattr(event_info, "server_name", None),
             "delay": 0,
+            "image": str(getattr(event_info, "image_url", "") or ""),
         })
         logger.info(f"Webhook 新增入库，已加入预热队列：{getattr(event_info, 'item_name', '') or item_id}")
 
@@ -937,24 +1007,73 @@ class StrmPrewarmer(_PluginBase):
         history = list(records) + list(history)
         self.save_data("history", history[:self._history_count])
 
+    @staticmethod
+    def _detail_text(record: dict) -> str:
+        """拼装单条记录的通知正文，风格贴近 MoviePilot 的入库通知。"""
+        media = record.get("media") or {}
+        lines = []
+        if media.get("resolution"):
+            quality = media["resolution"]
+            if media.get("range") and media["range"].upper() not in ("SDR", ""):
+                quality += f" {media['range']}"
+            lines.append(f"🖼️ 画面：{quality}")
+        if media.get("codec") or media.get("bitrate"):
+            codec = " · ".join(part for part in (media.get("codec"), media.get("bitrate")) if part)
+            lines.append(f"🎞️ 编码：{codec}")
+        if media.get("audio"):
+            lines.append(f"🔊 音轨：{media['audio']}")
+        if media.get("subtitle"):
+            lines.append(f"💬 字幕：{media['subtitle']}")
+        if record.get("elapsed"):
+            lines.append(f"⏱️ 耗时：{human_elapsed(float(record['elapsed']))}")
+        if record.get("server"):
+            lines.append(f"📺 服务器：{record['server']}")
+        if record.get("status") == "fail" and record.get("detail"):
+            lines.append(f"⚠️ 原因：{record['detail']}")
+        if record.get("status") == "changed":
+            lines.append("🔄 检测到 STRM 换源，已重新探测")
+        if record.get("filename"):
+            lines.append(f"📄 文件：{record['filename']}")
+        if not lines and record.get("detail"):
+            lines.append(record["detail"])
+        return "\n".join(lines)
+
     def _notify_records(self, records: List[dict], summary: bool = False) -> None:
-        """按配置推送预热结果通知。"""
+        """按配置推送预热结果通知，带媒体图片与分行排版。"""
         if not self._notify or not records:
             return
         success = [record for record in records if record.get("status") in ("success", "changed")]
         failed = [record for record in records if record.get("status") == "fail"]
         if not failed and not (success and self._notify_success):
             return
-        lines = []
-        for record in (records if summary else success + failed):
+        shown = success + failed
+        image = next((record.get("image") for record in shown if record.get("image")), "")
+        if len(shown) == 1:
+            record = shown[0]
+            flag = "❌ 媒体信息预热失败" if record.get("status") == "fail" else "✅ 媒体信息已预热"
+            self.post_message(
+                mtype=_MsgType.Plugin,
+                title=f"{record.get('title') or 'STRM 媒体'} {flag}",
+                text=self._detail_text(record),
+                image=image or None,
+            )
+            return
+        header = [f"✅ 成功 {len(success)} 个"] if success else []
+        if failed:
+            header.append(f"❌ 失败 {len(failed)} 个")
+        lines = [" · ".join(header)] if header else []
+        for record in shown[:15]:
             flag = {"success": "✅", "changed": "🔄", "fail": "❌"}.get(record.get("status"), "➖")
-            lines.append(f"{flag} {record.get('title')}\n{record.get('detail') or ''}".strip())
-        title = "STRM媒体信息预热"
-        if failed and not success:
-            title = "STRM媒体信息预热失败"
-        elif failed:
-            title = f"STRM媒体信息预热完成（失败{len(failed)}）"
-        self.post_message(mtype=_MsgType.Plugin, title=title, text="\n\n".join(lines[:20]))
+            media = record.get("media") or {}
+            brief = " ".join(part for part in (media.get("resolution"), media.get("codec")) if part) \
+                or (record.get("detail") or "")
+            lines.append(f"{flag} {record.get('title')}" + (f"（{brief}）" if brief else ""))
+        if len(shown) > 15:
+            lines.append(f"…… 其余 {len(shown) - 15} 个见插件详情页")
+        title = "STRM媒体信息预热完成" if not failed else (
+            "STRM媒体信息预热失败" if not success else f"STRM媒体信息预热完成，失败 {len(failed)} 个")
+        self.post_message(mtype=_MsgType.Plugin, title=title,
+                          text="\n".join(lines), image=image or None)
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:

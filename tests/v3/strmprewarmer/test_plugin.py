@@ -614,7 +614,7 @@ def test_handle_task_skips_duplicate_trigger():
     instance.__class__.service_infos = property(lambda self: {"Emby": service})
     try:
         instance._locate_item = lambda svc, task, title: item
-        instance._process_target = lambda name, svc, it, title, source, reason=None: (
+        instance._process_target = lambda name, svc, it, title, source, reason=None, image="": (
             processed.append(it["Id"]) or {"status": "success", "title": title, "detail": ""})
         instance._handle_task({"path": "/data/media/a.strm", "path_side": "emby", "source": "入库"})
         instance._handle_task({"item_id": "42", "source": "Webhook"})
@@ -752,3 +752,82 @@ def test_api_prewarm_allows_non_strm_when_configured():
     instance = _plugin(only_strm=False)
     instance._enabled = True
     assert instance.api_prewarm(path="/a.mkv").success is True
+
+
+def test_describe_streams_fields():
+    """媒体流应拆成分辨率、编码、码率、音轨、字幕等字段。"""
+    item = {"MediaSources": [{"MediaStreams": [
+        {"Type": "Video", "Codec": "hevc", "Width": 3840, "Height": 2160,
+         "BitRate": 25000000, "VideoRange": "HDR"},
+        {"Type": "Audio", "Codec": "eac3"},
+        {"Type": "Audio", "Codec": "aac"},
+        {"Type": "Subtitle", "Codec": "subrip"},
+    ]}]}
+    fields = plugin_module.describe_streams(item)
+    assert fields["resolution"] == "3840x2160"
+    assert fields["codec"] == "HEVC"
+    assert fields["bitrate"] == "25.0Mbps"
+    assert fields["range"] == "HDR"
+    assert fields["audio"] == "AAC/EAC3（2条）"
+    assert fields["subtitle"] == "1条"
+
+
+def test_human_elapsed():
+    """耗时格式化应区分秒与分钟。"""
+    assert plugin_module.human_elapsed(3.14) == "3.1秒"
+    assert plugin_module.human_elapsed(75) == "1分15秒"
+
+
+def test_media_image_prefers_message_image():
+    """图片优先取消息图，其次背景图字段。"""
+    class Media:
+        """带消息图的媒体信息替身。"""
+
+        def get_message_image(self):
+            """返回消息图。"""
+            return "http://img/message.jpg"
+
+    assert plugin_module.media_image(Media()) == "http://img/message.jpg"
+    assert plugin_module.media_image(types.SimpleNamespace(backdrop_path="http://img/b.jpg")) == \
+        "http://img/b.jpg"
+    assert plugin_module.media_image(None) == ""
+
+
+def test_single_record_notification_has_image_and_fields():
+    """单条通知应带图片，并按行展示画面、编码、音轨等信息。"""
+    instance = _plugin(notify=True, notify_success=True)
+    instance._notify_records([{
+        "status": "success", "title": "兰香如故 (2026) S01E01", "server": "Emby",
+        "elapsed": 2.5, "image": "http://img/a.jpg", "filename": "a.strm",
+        "media": {"resolution": "3840x2160", "range": "HDR", "codec": "HEVC",
+                  "bitrate": "25.0Mbps", "audio": "EAC3（1条）"},
+    }])
+    message = instance.messages[0]
+    assert message["image"] == "http://img/a.jpg"
+    assert "媒体信息已预热" in message["title"]
+    assert "🖼️ 画面：3840x2160 HDR" in message["text"]
+    assert "🎞️ 编码：HEVC · 25.0Mbps" in message["text"]
+    assert "🔊 音轨：EAC3（1条）" in message["text"]
+    assert "⏱️ 耗时：2.5秒" in message["text"]
+
+
+def test_batch_notification_summarizes():
+    """多条通知应给出成功失败汇总与清单。"""
+    instance = _plugin(notify=True, notify_success=True)
+    instance._notify_records([
+        {"status": "success", "title": "A", "media": {"resolution": "1920x1080", "codec": "H264"}},
+        {"status": "fail", "title": "B", "detail": "网络错误"},
+    ])
+    text = instance.messages[0]["text"]
+    assert "✅ 成功 1 个" in text and "❌ 失败 1 个" in text
+    assert "✅ A（1920x1080 H264）" in text
+    assert "❌ B（网络错误）" in text
+
+
+def test_failure_notification_includes_reason():
+    """失败通知应包含失败原因。"""
+    instance = _plugin(notify=True)
+    instance._notify_records([{"status": "fail", "title": "C", "detail": "PlaybackInfo 超时",
+                              "server": "Emby"}])
+    assert "⚠️ 原因：PlaybackInfo 超时" in instance.messages[0]["text"]
+    assert "预热失败" in instance.messages[0]["title"]

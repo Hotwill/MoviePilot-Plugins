@@ -508,3 +508,115 @@ def test_events_registered():
     """插件应注册入库与命令事件。"""
     names = {name for _, name in STUBS.event_manager.registered}
     assert {"on_transfer_complete", "on_plugin_action"}.issubset(names)
+
+
+# ----------------------------------------------------------------- 目录创建兼容性
+
+
+def test_remote_folder_falls_back_to_create_when_get_folder_unsupported(tmp_path):
+    """宿主没有实现 get_folder（如 v2.11.3）时应逐级 create_folder。"""
+    STUBS.storage_chain.get_folder_unsupported = True
+    instance = _plugin()
+    folder = instance._remote_folder("/cloud/media/电影/华语电影/片 (2026)")
+    assert folder is not None
+    created = [call[2] for call in STUBS.storage_chain.calls if call[0] == "create_folder"]
+    assert created == ["/cloud", "/cloud/media", "/cloud/media/电影",
+                      "/cloud/media/电影/华语电影", "/cloud/media/电影/华语电影/片 (2026)"]
+
+
+def test_remote_folder_skips_existing_levels():
+    """已存在的层级不应重复创建。"""
+    STUBS.storage_chain.get_folder_unsupported = True
+    STUBS.storage_chain.remote_dirs.update({"/cloud", "/cloud/media"})
+    instance = _plugin()
+    assert instance._remote_folder("/cloud/media/电影") is not None
+    created = [call[2] for call in STUBS.storage_chain.calls if call[0] == "create_folder"]
+    assert created == ["/cloud/media/电影"]
+
+
+def test_remote_folder_returns_none_when_create_fails():
+    """创建失败时返回 None，由上层记录失败原因。"""
+    STUBS.storage_chain.get_folder_unsupported = True
+    STUBS.storage_chain.folder_fails = True
+    assert _plugin()._remote_folder("/cloud/media/电影") is None
+
+
+def test_mirror_file_works_without_get_folder(tmp_path):
+    """在没有 get_folder 的宿主上也能完成镜像（回归 v2.11.3 失败问题）。"""
+    media = _library(tmp_path)
+    STUBS.storage_chain.get_folder_unsupported = True
+    instance = _plugin(source_roots=str(tmp_path), copy_sidecars=False)
+    record = instance.mirror_file(STUBS.file_item(path=str(media), name=media.name), "剧", "入库")
+    assert record["status"] == "success"
+    assert "/cloud/media/电视剧/国产剧/兰香如故 (2026)/Season 01/兰香如故 - S01E01.mkv" \
+        in STUBS.storage_chain.remote_files
+
+
+# ----------------------------------------------------------------- 通知排版
+
+
+def test_human_size_and_elapsed():
+    """大小与耗时格式化。"""
+    assert plugin_module.human_size(1536) == "1.50KB"
+    assert plugin_module.human_size(5 * 1024 ** 3) == "5.00GB"
+    assert plugin_module.human_size(0) == ""
+    assert plugin_module.human_elapsed(12.34) == "12.3秒"
+    assert plugin_module.human_elapsed(200) == "3分20秒"
+
+
+def test_single_notification_has_image_and_fields():
+    """单条通知应带图片并分行展示文件、大小、云盘路径、耗时。"""
+    instance = _plugin(notify=True, notify_success=True)
+    instance._notify_records([{
+        "status": "success", "title": "特立独行 (2026)", "filename": "特立独行.mp4",
+        "size": 3 * 1024 ** 3, "remote": "/移动云盘/media/电影/华语电影/特立独行 (2026)/特立独行.mp4",
+        "elapsed": 92.0, "extras": 2, "image": "http://img/a.jpg", "source": "入库",
+    }])
+    message = instance.messages[0]
+    assert message["image"] == "http://img/a.jpg"
+    assert "已镜像到云盘" in message["title"]
+    assert "📄 文件：特立独行.mp4" in message["text"]
+    assert "📦 大小：3.00GB" in message["text"]
+    assert "☁️ 云盘：/移动云盘/media" in message["text"]
+    assert "⏱️ 耗时：1分32秒" in message["text"]
+    assert "🧩 附属文件：2 个" in message["text"]
+
+
+def test_failure_notification_includes_reason():
+    """失败通知应包含失败原因。"""
+    instance = _plugin(notify=True)
+    instance._notify_records([{"status": "fail", "title": "片", "detail": "云盘目录创建失败",
+                              "remote": "/cloud/a.mkv", "source": "入库"}])
+    assert "⚠️ 原因：云盘目录创建失败" in instance.messages[0]["text"]
+    assert "云盘镜像失败" in instance.messages[0]["title"]
+
+
+def test_batch_notification_summarizes():
+    """多条通知应汇总成功失败数量。"""
+    instance = _plugin(notify=True, notify_success=True)
+    instance._notify_records([
+        {"status": "success", "title": "A", "size": 1024 ** 3},
+        {"status": "fail", "title": "B", "detail": "上传失败"},
+    ])
+    text = instance.messages[0]["text"]
+    assert "✅ 成功 1 个" in text and "❌ 失败 1 个" in text
+    assert "✅ A（1.00GB）" in text
+    assert "❌ B（上传失败）" in text
+
+
+def test_transfer_event_passes_media_image(tmp_path):
+    """入库事件应把媒体图片带进任务，用于通知配图。"""
+    media = _library(tmp_path)
+    instance = _plugin(enabled=True, source_roots=str(tmp_path))
+    try:
+        transferinfo = types.SimpleNamespace(
+            target_item=types.SimpleNamespace(path=str(media), storage="local"), file_list_new=[])
+        mediainfo = types.SimpleNamespace(title_year="兰香如故 (2026)", title="兰香如故",
+                                         type=types.SimpleNamespace(value="电视剧"),
+                                         category="国产剧",
+                                         get_message_image=lambda: "http://img/x.jpg")
+        instance.on_transfer_complete(types.SimpleNamespace(
+            event_data={"transferinfo": transferinfo, "mediainfo": mediainfo}))
+        assert instance._queue.get_nowait()["image"] == "http://img/x.jpg"
+    finally:
+        instance.stop_service()

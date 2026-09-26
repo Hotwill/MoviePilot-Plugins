@@ -3,13 +3,14 @@
     "name": "STRM媒体信息预热",
     "description": "STRM入库后立即调用Emby探测真实媒体信息（分辨率/编码/码率/音轨），避免首次播放等待。",
     "labels": "媒体库,Emby,STRM",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/strmprewarmer.png",
     "author": "Hotwill",
     "level": 1,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "通知改版：带媒体图片，按画面/编码/音轨/耗时分行展示，多条时给出成功失败汇总。",
       "v1.0.0": "首次发布：入库事件与Emby Webhook触发预热，支持定时补漏扫描、同名换源检测和历史记录。"
     }
   },
@@ -17,13 +18,14 @@
     "name": "媒体库云盘镜像",
     "description": "入库后把媒体库文件按相同目录结构再复制一份到OpenList/AList等云盘，实现本地与云盘双写。",
     "labels": "媒体库,云盘,OpenList",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/librarymirror.png",
     "author": "Hotwill",
     "level": 1,
     "release": false,
     "system_version": ">=3.0.0",
     "history": {
+      "v1.0.1": "修复在 MoviePilot v2.11.3 等未实现 get_folder 的宿主上「云盘目录创建失败」；通知改版带媒体图片与分行排版。",
       "v1.0.0": "首次发布：入库后按媒体库目录结构镜像到云盘，支持覆盖策略、刮削与字幕同步、定时补漏扫描与外部触发接口。"
     }
   }

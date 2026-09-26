@@ -133,26 +133,47 @@ class _FakeStorageChain:
     def reset(cls) -> None:
         """清空状态，供每个用例独立使用。"""
         cls.remote_files = {}
+        cls.remote_dirs = set()
         cls.calls = []
         cls.upload_fails = 0
         cls.folder_fails = False
+        cls.get_folder_unsupported = False
 
     def get_file_item(self, storage: str, path: Any) -> Optional[_FakeFileItem]:
-        """查询云盘文件。"""
+        """查询云盘文件或目录。"""
         key = str(path)
         self.calls.append(("get_file_item", storage, key))
+        if key in self.remote_dirs or key == "/":
+            return _FakeFileItem(storage=storage, type="dir", path=key,
+                                 name=key.rsplit("/", 1)[-1] or "/")
         if key not in self.remote_files:
             return None
         return _FakeFileItem(storage=storage, path=key, name=key.rsplit("/", 1)[-1],
                              size=self.remote_files[key])
 
+    # 模拟 MoviePilot v2.11.3：链上有 get_folder，但没有系统模块实现，恒返回 None
+    get_folder_unsupported: bool = False
+    # 已存在的云盘目录集合
+    remote_dirs: set = set()
+
     def get_folder(self, storage: str, path: Any) -> Optional[_FakeFileItem]:
         """获取或创建云盘目录。"""
         key = str(path)
         self.calls.append(("get_folder", storage, key))
+        if self.get_folder_unsupported or self.folder_fails:
+            return None
+        _FakeStorageChain.remote_dirs.add(key)
+        return _FakeFileItem(storage=storage, type="dir", path=key, name=key.rsplit("/", 1)[-1])
+
+    def create_folder(self, fileitem: Any, name: str) -> Optional[_FakeFileItem]:
+        """在父目录下创建子目录。"""
+        parent = str(fileitem.path).rstrip("/")
+        key = f"{parent}/{name}"
+        self.calls.append(("create_folder", fileitem.storage, key))
         if self.folder_fails:
             return None
-        return _FakeFileItem(storage=storage, type="dir", path=key, name=key.rsplit("/", 1)[-1])
+        _FakeStorageChain.remote_dirs.add(key)
+        return _FakeFileItem(storage=fileitem.storage, type="dir", path=key, name=name)
 
     def upload_file(self, fileitem: Any, path: Any, new_name: str = None) -> Optional[_FakeFileItem]:
         """上传文件到云盘目录。"""

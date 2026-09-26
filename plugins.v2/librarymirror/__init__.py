@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from apscheduler.triggers.cron import CronTrigger
@@ -76,6 +76,49 @@ class ApiResult(BaseModel):
     message: str = ""
     # 业务数据
     data: Dict[str, Any] = Field(default_factory=dict)
+
+
+def human_size(size: Optional[int]) -> str:
+    """把字节数格式化为人类可读的大小。"""
+    if not size:
+        return ""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.2f}{unit}"
+        value /= 1024
+    return f"{value:.2f}TB"
+
+
+def human_elapsed(seconds: float) -> str:
+    """把秒数格式化为「x分y秒」或「x.y秒」。"""
+    if seconds < 60:
+        return f"{seconds:.1f}秒"
+    minutes, rest = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}分{rest}秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}小时{minutes}分"
+
+
+def media_image(mediainfo: Any) -> str:
+    """取媒体图片地址，优先使用消息图（横版背景图）。"""
+    if not mediainfo:
+        return ""
+    for getter in ("get_message_image", "get_backdrop_image", "get_poster_image"):
+        method = getattr(mediainfo, getter, None)
+        if callable(method):
+            try:
+                image = method()
+            except Exception:
+                image = None
+            if image:
+                return str(image)
+    for attribute in ("backdrop_path", "poster_path"):
+        image = getattr(mediainfo, attribute, None)
+        if image:
+            return str(image)
+    return ""
 
 
 def parse_lines(text: str) -> Tuple[str, ...]:
@@ -171,7 +214,7 @@ class LibraryMirror(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/librarymirror.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "Hotwill"
     # 作者主页
@@ -353,12 +396,50 @@ class LibraryMirror(_PluginBase):
             return None
 
     def _remote_folder(self, remote_dir: str) -> Optional[FileItem]:
-        """获取云盘目录项，不存在则递归创建。"""
-        try:
-            return StorageChain().get_folder(storage=self._target_storage, path=Path(remote_dir))
-        except Exception as err:
-            logger.error(f"创建云盘目录 {remote_dir} 失败：{err}")
-            return None
+        """获取云盘目录项，不存在则逐级创建。
+
+        不能只依赖 ``StorageChain.get_folder``：MoviePilot v2.11.3 等版本的
+        文件管理模块并未实现 ``get_folder``，链路会静默返回 None。因此这里先用
+        已存在判断，再尝试宿主的 get_folder，最后回退到 ``create_folder`` 逐级创建。
+        """
+        existing = self._remote_item(remote_dir)
+        if existing is not None:
+            return existing
+        chain = StorageChain()
+        getter = getattr(chain, "get_folder", None)
+        if getter:
+            try:
+                folder = getter(storage=self._target_storage, path=Path(remote_dir))
+            except Exception as err:
+                logger.debug(f"宿主 get_folder 调用失败，改用逐级创建：{err}")
+                folder = None
+            if folder is not None:
+                return folder
+        return self._create_folders(remote_dir)
+
+    def _create_folders(self, remote_dir: str) -> Optional[FileItem]:
+        """按层级逐个创建云盘目录，返回最终目录项。"""
+        chain = StorageChain()
+        parts = [part for part in PurePosixPath(remote_dir).parts if part not in ("/", "")]
+        parent = self._remote_item("/") or FileItem(
+            storage=self._target_storage, type="dir", path="/", name="/")
+        current = ""
+        for part in parts:
+            current = f"{current}/{part}"
+            existing = self._remote_item(current)
+            if existing is not None:
+                parent = existing
+                continue
+            try:
+                created = chain.create_folder(fileitem=parent, name=part)
+            except Exception as err:
+                logger.error(f"创建云盘目录 {current} 失败：{err}")
+                return None
+            if not created:
+                logger.error(f"创建云盘目录 {current} 失败，请检查 OpenList 该路径是否可写")
+                return None
+            parent = created
+        return parent
 
     def should_upload(self, local_path: str, remote: Optional[FileItem]) -> Tuple[bool, str]:
         """按覆盖策略判断是否需要上传，返回 (是否上传, 原因)。"""
@@ -423,7 +504,8 @@ class LibraryMirror(_PluginBase):
 
     # ------------------------------------------------------------------ 镜像流程
 
-    def mirror_file(self, item: FileItem, title: str, source: str) -> Optional[dict]:
+    def mirror_file(self, item: FileItem, title: str, source: str,
+                    image: str = "") -> Optional[dict]:
         """镜像单个媒体文件（含附属文件），返回历史记录。"""
         local_path = str(getattr(item, "path", "") or "")
         if not local_path:
@@ -446,8 +528,14 @@ class LibraryMirror(_PluginBase):
                 "source": source,
                 "status": "fail",
                 "detail": "未匹配到媒体库根目录",
+                "image": image or "",
+                "filename": Path(local_path).name,
             }
 
+        try:
+            file_size = Path(local_path).stat().st_size
+        except OSError:
+            file_size = 0
         record = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "title": title or Path(local_path).name,
@@ -456,6 +544,9 @@ class LibraryMirror(_PluginBase):
             "source": source,
             "status": "skip",
             "detail": "",
+            "size": file_size,
+            "image": image or "",
+            "filename": Path(local_path).name,
         }
         needed, reason = self.should_upload(local_path, self._remote_item(remote_path))
         if not needed:
@@ -475,10 +566,12 @@ class LibraryMirror(_PluginBase):
                 extras = self._mirror_sidecars(local_path) if self._copy_sidecars else 0
                 record.update(
                     status="success",
-                    detail=f"{reason} → 已上传 用时{elapsed:.1f}s"
+                    elapsed=round(elapsed, 1),
+                    extras=extras,
+                    detail=f"{reason} → 已上传 用时{human_elapsed(elapsed)}"
                            + (f" 附属文件{extras}个" if extras else ""),
                 )
-                logger.info(f"镜像成功 {remote_path} 用时{elapsed:.1f}s"
+                logger.info(f"镜像成功 {remote_path} 用时{human_elapsed(elapsed)}"
                             + (f"，附属文件 {extras} 个" if extras else ""))
                 return record
             error = message
@@ -552,7 +645,9 @@ class LibraryMirror(_PluginBase):
             try:
                 item = FileItem(storage=task.get("storage") or "local", type="file",
                                 path=path, name=Path(path).name)
-                record = self.mirror_file(item, task.get("title") or "", task.get("source") or "入库")
+                record = self.mirror_file(item, task.get("title") or "",
+                                          task.get("source") or "入库",
+                                          image=task.get("image") or "")
                 if record:
                     records.append(record)
             finally:
@@ -597,6 +692,7 @@ class LibraryMirror(_PluginBase):
             "storage": storage,
             "title": title,
             "source": "入库",
+            "image": media_image(mediainfo),
         })
         logger.info(f"已加入云盘镜像队列：{title or paths[0]}（{len(paths)} 个文件）")
 
@@ -656,24 +752,61 @@ class LibraryMirror(_PluginBase):
         history = self.get_data("history") or []
         self.save_data("history", (list(records) + list(history))[:self._history_count])
 
+    @staticmethod
+    def _detail_text(record: dict) -> str:
+        """拼装单条记录的通知正文，风格贴近 MoviePilot 的入库通知。"""
+        lines = []
+        if record.get("filename"):
+            lines.append(f"📄 文件：{record['filename']}")
+        if record.get("size"):
+            lines.append(f"📦 大小：{human_size(record.get('size'))}")
+        if record.get("remote"):
+            lines.append(f"☁️ 云盘：{record['remote']}")
+        if record.get("elapsed"):
+            lines.append(f"⏱️ 耗时：{human_elapsed(float(record['elapsed']))}")
+        if record.get("extras"):
+            lines.append(f"🧩 附属文件：{record['extras']} 个")
+        if record.get("status") == "fail" and record.get("detail"):
+            lines.append(f"⚠️ 原因：{record['detail']}")
+        if record.get("source"):
+            lines.append(f"🏷️ 触发：{record['source']}")
+        return "\n".join(lines)
+
     def _notify_records(self, records: List[dict], summary: bool = False) -> None:
-        """按配置推送镜像结果通知。"""
+        """按配置推送镜像结果通知，带媒体图片与分行排版。"""
         if not self._notify or not records:
             return
         success = [record for record in records if record.get("status") == "success"]
         failed = [record for record in records if record.get("status") == "fail"]
         if not failed and not (success and self._notify_success):
             return
-        lines = []
-        for record in (records if summary else success + failed):
+        shown = success + failed
+        image = next((record.get("image") for record in shown if record.get("image")), "")
+        if len(shown) == 1:
+            record = shown[0]
+            flag = "✅ 已镜像到云盘" if record.get("status") == "success" else "❌ 云盘镜像失败"
+            self.post_message(
+                mtype=_MsgType.Plugin,
+                title=f"{record.get('title') or '媒体文件'} {flag}",
+                text=self._detail_text(record),
+                image=image or None,
+            )
+            return
+        # 多条时给出汇总 + 明细清单
+        header = [f"✅ 成功 {len(success)} 个"] if success else []
+        if failed:
+            header.append(f"❌ 失败 {len(failed)} 个")
+        lines = [" · ".join(header)] if header else []
+        for record in shown[:15]:
             flag = {"success": "✅", "fail": "❌"}.get(record.get("status"), "➖")
-            lines.append(f"{flag} {record.get('title')}\n{record.get('remote') or ''}".strip())
-        title = "媒体库云盘镜像"
-        if failed and not success:
-            title = "媒体库云盘镜像失败"
-        elif failed:
-            title = f"媒体库云盘镜像完成（失败{len(failed)}）"
-        self.post_message(mtype=_MsgType.Plugin, title=title, text="\n\n".join(lines[:20]))
+            detail = record.get("detail") if record.get("status") == "fail" else human_size(record.get("size"))
+            lines.append(f"{flag} {record.get('title')}" + (f"（{detail}）" if detail else ""))
+        if len(shown) > 15:
+            lines.append(f"…… 其余 {len(shown) - 15} 个见插件详情页")
+        title = "媒体库云盘镜像完成" if not failed else (
+            "媒体库云盘镜像失败" if not success else f"媒体库云盘镜像完成，失败 {len(failed)} 个")
+        self.post_message(mtype=_MsgType.Plugin, title=title,
+                          text="\n".join(lines), image=image or None)
 
     def stop_service(self) -> None:
         """停止后台线程并释放资源，可重复调用。"""

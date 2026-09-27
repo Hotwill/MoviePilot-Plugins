@@ -822,7 +822,8 @@ def test_batch_notification_summarizes():
     text = instance.messages[0]["text"]
     assert "✅ 成功 1 个" in text and "❌ 失败 1 个" in text
     assert "✅ A（1920x1080 H264）" in text
-    assert "❌ B（网络错误）" in text
+    assert "失败原因：" in text and "网络错误 × 1" in text
+    assert "❌ B" in text
 
 
 def test_failure_notification_includes_reason():
@@ -859,3 +860,113 @@ def test_form_hint_mentions_fullrefresh_pitfall():
     text = json.dumps(form, ensure_ascii=False)
     assert "FullRefresh" in text
     assert "补漏扫描" in text
+
+
+@pytest.mark.parametrize("item,expected", [
+    ({"SeriesName": "豪斯医生", "ParentIndexNumber": 1, "IndexNumber": 12, "Name": "运动医学"},
+     "豪斯医生 S01E12 运动医学"),
+    ({"SeriesName": "顺风妇产科", "ParentIndexNumber": 1, "IndexNumber": 401, "Name": "第 401 集"},
+     "顺风妇产科 S01E401 第 401 集"),
+    ({"SeriesName": "某剧", "IndexNumber": 5, "Name": "第 5 集"}, "某剧 E05 第 5 集"),
+    ({"Name": "盗梦空间", "ProductionYear": 2010}, "盗梦空间 (2010)"),
+    ({"Name": "长安的荔枝 (2026)", "ProductionYear": 2026}, "长安的荔枝 (2026)"),
+    ({"Name": "无年份电影"}, "无年份电影"),
+    ({}, ""),
+])
+def test_display_name(item, expected):
+    """条目名称应可分辨剧名与季集，电影带年份。"""
+    assert plugin_module.display_name(item) == expected
+
+
+def test_strm_link_reads_first_line(tmp_path):
+    """应读取 STRM 的第一行链接。"""
+    strm = tmp_path / "a.strm"
+    strm.write_text("\n\nhttps://host/a.mkv?sign=x\n", encoding="utf-8")
+    assert plugin_module.strm_link(str(strm)) == "https://host/a.mkv?sign=x"
+    assert plugin_module.strm_link(str(tmp_path / "missing.strm")) == ""
+    assert plugin_module.strm_link(None) == ""
+
+
+def test_link_failure_reason_reports_http_status(tmp_path):
+    """链接返回 5xx 时应报出状态码与服务端提示。"""
+    strm = tmp_path / "a.strm"
+    strm.write_text("https://host/a.mkv", encoding="utf-8")
+    instance = _plugin(path_mappings=f"{tmp_path} => /data/media")
+
+    class Response:
+        """带错误正文的响应替身。"""
+
+        status_code = 500
+        text = "<h1>500</h1><p>failed link: failed to get file: object not found</p>"
+
+    STUBS.request_utils.responses = {"default": Response()}
+    reason = instance._link_failure_reason("/data/media/a.strm")
+    assert "HTTP 500" in reason
+    assert "object not found" in reason
+
+
+def test_link_failure_reason_handles_no_response(tmp_path):
+    """链接无响应时应提示超时或无法连接。"""
+    strm = tmp_path / "a.strm"
+    strm.write_text("https://host/a.mkv", encoding="utf-8")
+    instance = _plugin(path_mappings=f"{tmp_path} => /data/media")
+    STUBS.request_utils.responses = {"default": None}
+    assert "无响应" in instance._link_failure_reason("/data/media/a.strm")
+
+
+def test_link_failure_reason_missing_strm(tmp_path):
+    """读不到 STRM 内容时应提示检查路径映射。"""
+    instance = _plugin(path_mappings=f"{tmp_path} => /data/media")
+    assert "路径映射" in instance._link_failure_reason("/data/media/missing.strm")
+
+
+def test_link_check_can_be_disabled(tmp_path):
+    """关闭链接检测后不做任何请求。"""
+    instance = _plugin(check_link=False)
+    assert instance._link_failure_reason("/data/media/a.strm") == ""
+
+
+def test_process_target_failure_appends_link_reason(tmp_path):
+    """预热失败且媒体信息不完整时，失败原因应附带链接检测结果。"""
+    strm = tmp_path / "b.strm"
+    strm.write_text("https://host/b.mkv", encoding="utf-8")
+    instance = _plugin(path_mappings=f"{tmp_path} => /data/media", max_retries=0)
+    instance._prewarm = lambda service, item_id: (False, "PlaybackInfo 已完成但媒体信息仍不完整")
+
+    class Response:
+        """404 响应替身。"""
+
+        status_code = 404
+        text = "not found"
+
+    STUBS.request_utils.responses = {"default": Response()}
+    item = {"Id": "1", "Path": "/data/media/b.strm", "Name": "运动医学",
+            "SeriesName": "豪斯医生", "ParentIndexNumber": 1, "IndexNumber": 12,
+            "MediaSources": [{"MediaStreams": []}]}
+    record = instance._process_target("Emby", _service(), item, "", "入库")
+    assert record["status"] == "fail"
+    assert record["title"] == "豪斯医生 S01E12 运动医学"
+    assert "链接失效：HTTP 404" in record["detail"]
+
+
+def test_scan_records_use_display_name():
+    """全量扫描的历史标题应是可读名称。"""
+    instance = _plugin()
+    captured = {}
+
+    def fake_process(name, service, item, title, source, reason=None, image=""):
+        """记录传入的标题。"""
+        captured["title"] = title
+        return {"status": "success", "title": title}
+
+    instance._process_target = fake_process
+    instance._collect_scan_targets = lambda service, service_name: [
+        ({"Id": "9", "Path": "/a.strm", "Name": "第 3 集", "SeriesName": "某剧",
+          "ParentIndexNumber": 2, "IndexNumber": 3}, "incomplete")]
+    service = _service()
+    instance.__class__.service_infos = property(lambda self: {"Emby": service})
+    try:
+        instance.full_scan()
+    finally:
+        del instance.__class__.service_infos
+    assert captured["title"] == "某剧 S02E03 第 3 集"

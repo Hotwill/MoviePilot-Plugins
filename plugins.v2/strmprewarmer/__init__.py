@@ -202,6 +202,49 @@ def describe_mediainfo(item: dict) -> str:
     return " ".join(parts)
 
 
+def display_name(item: dict) -> str:
+    """生成人类可读的条目名称。
+
+    剧集输出「剧名 S01E12 集名」，电影输出「片名 (年份)」，
+    避免日志和通知里只剩「第 1 集」这种无法分辨的标题。
+    """
+    if not item:
+        return ""
+    name = str(item.get("Name") or "").strip()
+    series = str(item.get("SeriesName") or "").strip()
+    if series:
+        season, episode = item.get("ParentIndexNumber"), item.get("IndexNumber")
+        tag = ""
+        try:
+            if season is not None and episode is not None:
+                tag = f" S{int(season):02d}E{int(episode):02d}"
+            elif episode is not None:
+                tag = f" E{int(episode):02d}"
+        except (TypeError, ValueError):
+            tag = ""
+        return f"{series}{tag}" + (f" {name}" if name and name != series else "")
+    year = item.get("ProductionYear")
+    if year and f"({year})" not in name:
+        return f"{name} ({year})".strip()
+    return name
+
+
+def strm_link(local_path: Optional[str]) -> str:
+    """读取 STRM 文件里的第一行链接。"""
+    if not local_path:
+        return ""
+    try:
+        candidate = Path(local_path)
+        if not candidate.is_file():
+            return ""
+        for line in candidate.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.strip():
+                return line.strip()
+    except OSError:
+        return ""
+    return ""
+
+
 def human_elapsed(seconds: float) -> str:
     """把秒数格式化为易读文本。"""
     if seconds < 60:
@@ -290,7 +333,7 @@ class StrmPrewarmer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/strmprewarmer.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Hotwill"
     # 作者主页
@@ -323,6 +366,8 @@ class StrmPrewarmer(_PluginBase):
         self._deep_lookup = True
         self._deep_lookup_limit = 20000
         self._dedup_window = 600
+        self._check_link = True
+        self._link_timeout = 15
         self._cron = ""
         self._onlyonce = False
         self._scan_roots: Tuple[str, ...] = ()
@@ -363,6 +408,8 @@ class StrmPrewarmer(_PluginBase):
         self._deep_lookup = bool(config.get("deep_lookup", True))
         self._deep_lookup_limit = max(500, self._to_int(config.get("deep_lookup_limit"), 20000))
         self._dedup_window = max(0, self._to_int(config.get("dedup_window"), 600))
+        self._check_link = bool(config.get("check_link", True))
+        self._link_timeout = max(3, self._to_int(config.get("link_timeout"), 15))
         self._cron = (config.get("cron") or "").strip()
         self._onlyonce = bool(config.get("onlyonce"))
         self._scan_roots = parse_roots(config.get("scan_roots"))
@@ -430,6 +477,8 @@ class StrmPrewarmer(_PluginBase):
             "deep_lookup": self._deep_lookup,
             "deep_lookup_limit": self._deep_lookup_limit,
             "dedup_window": self._dedup_window,
+            "check_link": self._check_link,
+            "link_timeout": self._link_timeout,
             "cron": self._cron,
             "onlyonce": False,
             "scan_roots": "\n".join(self._scan_roots),
@@ -629,6 +678,40 @@ class StrmPrewarmer(_PluginBase):
             return False, "PlaybackInfo 已完成但媒体信息仍不完整"
         return True, describe_mediainfo(item)
 
+    def _link_failure_reason(self, item_path: str) -> str:
+        """探测 STRM 链接本身是否可用，把失败原因说清楚。
+
+        Emby 无法探测媒体信息时，最常见的原因是链接已经失效（网盘文件被移动或删除、
+        302 服务报错）。这里主动请求一小段内容，把真实 HTTP 状态和服务端提示带回来。
+        """
+        if not self._check_link:
+            return ""
+        link = strm_link(self._local_path(item_path))
+        if not link:
+            return "无法读取 STRM 内容（检查路径映射）"
+        if not link.lower().startswith(("http://", "https://")):
+            return "" if Path(link).exists() else f"STRM 指向的本地文件不存在：{link}"
+        try:
+            response = RequestUtils(timeout=self._link_timeout).get_res(
+                link, headers={"Range": "bytes=0-1024"})
+        except Exception as err:
+            return f"链接请求异常：{type(err).__name__}"
+        if response is None:
+            return "链接无响应（超时或无法连接）"
+        if response.status_code >= 400:
+            hint = ""
+            try:
+                text = (response.text or "")[:400]
+            except Exception:
+                text = ""
+            for marker in ("object not found", "failed link", "not found", "forbidden",
+                           "unauthorized", "sign"):
+                if marker in text.lower():
+                    hint = f"（{marker}）"
+                    break
+            return f"链接失效：HTTP {response.status_code}{hint}"
+        return ""
+
     def _local_path(self, emby_path: str) -> str:
         """把 Emby 路径还原为 MoviePilot 可访问的本地路径。"""
         return apply_mapping(emby_path, self._mappings, reverse=True)
@@ -677,7 +760,7 @@ class StrmPrewarmer(_PluginBase):
         """
         item_id = str(item.get("Id"))
         item_path = item.get("Path") or ""
-        display = title or item.get("Name") or item_path
+        display = display_name(item) or title or item_path
         local_path = self._local_path(item_path)
         signature = file_fingerprint(local_path)
         record = {
@@ -733,12 +816,18 @@ class StrmPrewarmer(_PluginBase):
                 return record
             error = str(message)
             if attempt < self._max_retries:
-                logger.warning(f"预热失败 {display}：{error}，{self._retry_interval}s 后重试")
+                logger.warning(f"预热失败 {display}（{Path(item_path).name}）："
+                               f"{error}，{self._retry_interval}s 后重试")
                 if self._stop_event.wait(self._retry_interval):
                     break
+        if "媒体信息仍不完整" in error:
+            # 最常见原因是链接失效，主动探测一次把真实状态带进历史与通知
+            reason = self._link_failure_reason(item_path)
+            if reason:
+                error = f"{error}；{reason}"
         record["status"] = "fail"
         record["detail"] = error
-        logger.error(f"预热失败 {display}：{error}")
+        logger.error(f"预热失败 {display}（{item_path}）：{error}")
         return record
 
     def _worker_loop(self) -> None:
@@ -944,7 +1033,7 @@ class StrmPrewarmer(_PluginBase):
                         self._inflight.add(key)
                     try:
                         records.append(self._process_target(
-                            name, service, item, item.get("Name") or "", source, reason=reason))
+                            name, service, item, display_name(item), source, reason=reason))
                     finally:
                         with self._lock:
                             self._inflight.discard(key)
@@ -1064,14 +1153,38 @@ class StrmPrewarmer(_PluginBase):
         if failed:
             header.append(f"❌ 失败 {len(failed)} 个")
         lines = [" · ".join(header)] if header else []
-        for record in shown[:15]:
-            flag = {"success": "✅", "changed": "🔄", "fail": "❌"}.get(record.get("status"), "➖")
-            media = record.get("media") or {}
-            brief = " ".join(part for part in (media.get("resolution"), media.get("codec")) if part) \
-                or (record.get("detail") or "")
-            lines.append(f"{flag} {record.get('title')}" + (f"（{brief}）" if brief else ""))
-        if len(shown) > 15:
-            lines.append(f"…… 其余 {len(shown) - 15} 个见插件详情页")
+        if failed:
+            # 失败原因归类，避免长列表刷屏又看不出问题
+            reasons: Dict[str, int] = {}
+            for record in failed:
+                reason = str(record.get("detail") or "未知原因")
+                for keyword in ("链接失效", "链接无响应", "链接请求异常", "无法读取 STRM 内容",
+                                "媒体信息仍不完整", "HTTP "):
+                    if keyword in reason:
+                        reason = reason[reason.index(keyword):][:40]
+                        break
+                reasons[reason] = reasons.get(reason, 0) + 1
+            lines.append("")
+            lines.append("失败原因：")
+            for reason, count in sorted(reasons.items(), key=lambda item: -item[1])[:5]:
+                lines.append(f"• {reason} × {count}")
+        if success:
+            lines.append("")
+            lines.append("成功明细：")
+            for record in success[:10]:
+                media = record.get("media") or {}
+                brief = " ".join(part for part in (media.get("resolution"), media.get("codec")) if part)
+                flag = "🔄" if record.get("status") == "changed" else "✅"
+                lines.append(f"{flag} {record.get('title')}" + (f"（{brief}）" if brief else ""))
+            if len(success) > 10:
+                lines.append(f"…… 其余 {len(success) - 10} 个成功项见插件详情页")
+        if failed:
+            lines.append("")
+            lines.append("失败明细：")
+            for record in failed[:10]:
+                lines.append(f"❌ {record.get('title')}")
+            if len(failed) > 10:
+                lines.append(f"…… 其余 {len(failed) - 10} 个失败项见插件详情页")
         title = "STRM媒体信息预热完成" if not failed else (
             "STRM媒体信息预热失败" if not success else f"STRM媒体信息预热完成，失败 {len(failed)} 个")
         self.post_message(mtype=_MsgType.Plugin, title=title,
@@ -1296,6 +1409,11 @@ class StrmPrewarmer(_PluginBase):
                     switch("deep_lookup", "深度查找条目", "Path 查询不可用时遍历媒体库匹配路径"),
                 ]),
                 row([
+                    switch("check_link", "失败时检测链接", "预热失败时请求 STRM 链接，报出真实 HTTP 状态"),
+                    text("link_timeout", "链接检测超时（秒）", "15"),
+                    text("history_count", "历史保留条数", "200"),
+                ]),
+                row([
                     text("max_bitrate", "探测码率上限", "200000000", "PlaybackInfo 请求参数"),
                     text("deep_lookup_limit", "深度查找上限", "20000", "深度查找最多遍历的条目数"),
                     text("dedup_window", "去重窗口（秒）", "600", "窗口内同一条目不重复预热"),
@@ -1367,6 +1485,9 @@ class StrmPrewarmer(_PluginBase):
             "deep_lookup": True,
             "deep_lookup_limit": 20000,
             "dedup_window": 600,
+            "check_link": True,
+            "link_timeout": 15,
+            "history_count": 200,
             "max_bitrate": 200000000,
             "path_mappings": "",
             "scan_roots": "",
@@ -1400,7 +1521,8 @@ class StrmPrewarmer(_PluginBase):
                         "text": status_text.get(record.get("status"), record.get("status") or ""),
                     }]},
                     {"component": "td", "text": record.get("detail") or ""},
-                    {"component": "td", "props": {"class": "text-caption"}, "text": record.get("path") or ""},
+                    {"component": "td", "props": {"class": "text-caption"},
+                     "text": record.get("path") or ""},
                 ],
             })
         return [{

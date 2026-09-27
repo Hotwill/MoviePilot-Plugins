@@ -1,5 +1,6 @@
 """STRM 媒体信息预热插件单元测试。"""
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -831,3 +832,30 @@ def test_failure_notification_includes_reason():
                               "server": "Emby"}])
     assert "⚠️ 原因：PlaybackInfo 超时" in instance.messages[0]["text"]
     assert "预热失败" in instance.messages[0]["title"]
+
+
+def test_trigger_refresh_params_avoid_invalid_image_mode():
+    """条目刷新不得传 ImageRefreshMode=None（部分 Emby 版本会返回 400）。"""
+    instance = _plugin()
+    captured = {}
+
+    def fake_request(service, method, path, params=None, json_body=None):
+        """记录刷新请求参数。"""
+        captured.update({"method": method, "path": path, "params": params or {}})
+        return True, None
+
+    instance._request = fake_request
+    instance._trigger_refresh(_service(), "123")
+    assert captured["method"] == "POST"
+    assert captured["path"] == "Items/123/Refresh"
+    assert captured["params"]["MetadataRefreshMode"] == "FullRefresh"
+    assert captured["params"]["ImageRefreshMode"] == "ValidationOnly"
+    assert captured["params"]["ReplaceAllMetadata"] == "false"
+
+
+def test_form_hint_mentions_fullrefresh_pitfall():
+    """配置页应提示全量刷新会清空媒体信息，并建议配置补漏扫描。"""
+    form, _defaults = _plugin().get_form()
+    text = json.dumps(form, ensure_ascii=False)
+    assert "FullRefresh" in text
+    assert "补漏扫描" in text

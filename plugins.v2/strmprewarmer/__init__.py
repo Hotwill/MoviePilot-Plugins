@@ -290,7 +290,7 @@ class StrmPrewarmer(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/Hotwill/MoviePilot-Plugins/main/icons/strmprewarmer.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "Hotwill"
     # 作者主页
@@ -594,10 +594,12 @@ class StrmPrewarmer(_PluginBase):
     def _trigger_refresh(self, service: ServiceInfo, item_id: str = None) -> None:
         """触发 Emby 刷新：指定条目时刷新单项，否则刷新媒体库根。"""
         if item_id:
+            # ImageRefreshMode 不能传 "None"：部分 Emby 版本会直接返回 400，
+            # 这里用 ValidationOnly 表示「不重新抓图」。
             ok, message = self._request(service, "POST", f"Items/{item_id}/Refresh", {
                 "Recursive": "false",
                 "MetadataRefreshMode": "FullRefresh",
-                "ImageRefreshMode": "None",
+                "ImageRefreshMode": "ValidationOnly",
                 "ReplaceAllMetadata": "false",
             })
             if not ok:
@@ -1282,7 +1284,9 @@ class StrmPrewarmer(_PluginBase):
                     text("timeout", "请求超时（秒）", "300", "网盘响应慢时可增大"),
                 ]),
                 row([
-                    text("cron", "定时补漏扫描", "0 3 * * *", "留空则不执行定时全量扫描"),
+                    text("cron", "定时补漏扫描", "0 3 * * *",
+                         "强烈建议配置：Emby 全量刷新元数据会清掉已探测的媒体信息，"
+                         "定时扫描可自动补回。请排在刷新任务之后"),
                     text("max_items", "单次最多处理", "0", "0 表示不限制"),
                     text("item_interval", "条目间隔（秒）", "1"),
                 ]),
@@ -1330,7 +1334,10 @@ class StrmPrewarmer(_PluginBase):
                         "component": "VAlert",
                         "props": {
                             "type": "info", "variant": "tonal",
-                            "text": "工作原理：STRM 入库后调用 Emby PlaybackInfo 接口，"
+                            "text": "注意：Emby 的「全量刷新元数据」(FullRefresh) 会清空已探测的媒体信息，"
+                                    "例如 Emby 自带的媒体库刷新任务或「Emby元数据刷新」类插件。"
+                                    "遇到「预热成功后过一段时间又没有了」，配置上面的定时补漏扫描并排在刷新任务之后即可自动补回。\n"
+                                    "工作原理：STRM 入库后调用 Emby PlaybackInfo 接口，"
                                     "让 Emby 用 ffprobe 读取真实媒体信息并保存到自己的媒体库。"
                                     "不下载完整视频、不修改 STRM 和 NFO、不写入虚假信息。"
                                     "若 Emby 尚未扫描到新文件，可搭配官方「媒体库服务器刷新」插件或开启实时监控。",

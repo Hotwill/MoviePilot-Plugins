@@ -130,6 +130,23 @@ Emby 用 ffprobe 读取真实媒体信息
 **一直提示未找到对应条目**：Emby 还没扫描到新文件。开启 Emby 实时监控、启用官方
 「媒体库服务器刷新」插件，或打开「找不到时扫描媒体库」，并适当增大「等待识别超时」。
 
+**预热成功后过一段时间媒体信息又没有了**：Emby 的「全量刷新元数据」(`MetadataRefreshMode=FullRefresh`)
+会清空已探测的 MediaInfo。实测结论：
+
+| 刷新方式 | 已探测的媒体信息 |
+| --- | --- |
+| `MetadataRefreshMode=FullRefresh`（`ReplaceAllMetadata` 无论 true/false） | ❌ 被清空 |
+| `MetadataRefreshMode=Default` | ✅ 保留 |
+| `MetadataRefreshMode=ValidationOnly` | ✅ 保留 |
+
+常见触发源：Emby 自带的媒体库「刷新元数据」任务、以及「Emby元数据刷新」这类会对最新入库条目
+执行 FullRefresh 的插件。处理办法：
+
+1. 给本插件配置「定时补漏扫描」，时间排在那些刷新任务之后（例如刷新任务 `5 1 * * *`，这里就填 `0 3 * * *`），
+   被清掉的条目会在下一轮自动补回；
+2. 或者把做全量刷新的任务关掉、改成 Default 模式、缩小它的作用范围；
+3. 只需要中文演职人员时，优先用官方「演职人员刮削」插件，它不会做全量刷新。
+
 **PlaybackInfo 成功但媒体信息仍不完整**：通常是 STRM 地址失效、302 服务无法返回真实
 直链、pickcode 失效，或文件名中的 `#` 未编码成 `%23`。
 
